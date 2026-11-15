@@ -167,15 +167,34 @@ fn save_to(p: &Path, m: &Manifest) -> Result<()> {
     Ok(())
 }
 
+/// 记录条数上限：清单只增不减的话长期使用会无限膨胀，按上限裁掉最旧的记录
+const MAX_CLIENT_RECORDS: usize = 30;
+const MAX_MOD_RECORDS: usize = 100;
+
 fn mutate<T>(f: impl FnOnce(&mut Manifest) -> T) -> T {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let p = path();
     let mut m = read_from(&p);
     let out = f(&mut m);
+    trim(&mut m);
     if let Err(e) = save_to(&p, &m) {
         eprintln!("写入下载清单失败: {e}");
     }
     out
+}
+
+/// 超上限时裁掉最旧的记录（客户端按安装时间排序，模组先按时间排再恢复字典序）
+fn trim(m: &mut Manifest) {
+    if m.clients.len() > MAX_CLIENT_RECORDS {
+        m.clients
+            .sort_by(|a, b| b.installed_at.cmp(&a.installed_at));
+        m.clients.truncate(MAX_CLIENT_RECORDS);
+    }
+    if m.mods.len() > MAX_MOD_RECORDS {
+        m.mods.sort_by(|a, b| b.installed_at.cmp(&a.installed_at));
+        m.mods.truncate(MAX_MOD_RECORDS);
+        m.mods.sort_by_key(|r| r.file_name.to_lowercase());
+    }
 }
 
 // ---------- 记录 ----------
@@ -204,7 +223,8 @@ pub fn record_download(origin: &Origin, file_name: &str, url: &str, size: u64, s
                 None => m.clients.push(rec),
             }
             // 最新的排前面，便于前端直接展示
-            m.clients.sort_by(|a, b| b.installed_at.cmp(&a.installed_at));
+            m.clients
+                .sort_by(|a, b| b.installed_at.cmp(&a.installed_at));
         }
         Origin::Mod {
             source,
@@ -228,8 +248,7 @@ pub fn record_download(origin: &Origin, file_name: &str, url: &str, size: u64, s
                 Some(existing) => *existing = rec,
                 None => m.mods.push(rec),
             }
-            m.mods
-                .sort_by(|a, b| a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()));
+            m.mods.sort_by_key(|r| r.file_name.to_lowercase());
         }
     });
 }
@@ -351,8 +370,7 @@ pub fn sync() -> Manifest {
 
         m.clients
             .sort_by(|a, b| b.installed_at.cmp(&a.installed_at));
-        m.mods
-            .sort_by(|a, b| a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()));
+        m.mods.sort_by_key(|r| r.file_name.to_lowercase());
         m.clone()
     })
 }
@@ -428,7 +446,7 @@ fn iso_from_secs(secs: i64) -> String {
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as i64;
+    let doe = z - era * 146_097;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);

@@ -137,9 +137,10 @@ pub async fn request_device_code() -> Result<DeviceCode> {
             &body[..body.len().min(300)]
         )));
     }
-    let body: DeviceCodeResponse = resp.json().await.map_err(|e| {
-        LauncherError::Message(format!("设备码响应解析失败: {e}"))
-    })?;
+    let body: DeviceCodeResponse = resp
+        .json()
+        .await
+        .map_err(|e| LauncherError::Message(format!("设备码响应解析失败: {e}")))?;
     Ok(DeviceCode {
         device_code: body.device_code,
         user_code: body.user_code,
@@ -194,20 +195,20 @@ pub async fn poll_device_code(code: &DeviceCode, cancel: &CancellationToken) -> 
             "authorization_pending" => {}
             "slow_down" => interval += Duration::from_secs(5),
             "expired_token" => {
-                return Err(LauncherError::Message("设备码已过期，请重新登录".into()))
+                return Err(LauncherError::Message("设备码已过期，请重新登录".into()));
             }
             "authorization_declined" => {
-                return Err(LauncherError::Message("你已拒绝本次授权".into()))
+                return Err(LauncherError::Message("你已拒绝本次授权".into()));
             }
             "bad_verification_code" => {
-                return Err(LauncherError::Message("设备码无效，请重新登录".into()))
+                return Err(LauncherError::Message("设备码无效，请重新登录".into()));
             }
             _ => {
                 return Err(LauncherError::Message(format!(
                     "登录被拒绝 ({}): {}",
                     err.error,
                     err.error_description.unwrap_or_default()
-                )))
+                )));
             }
         }
 
@@ -239,7 +240,9 @@ fn token_from_body(body: MsaTokenResponse) -> Result<MsaToken> {
     Ok(MsaToken {
         access_token: body.access_token,
         refresh_token: body.refresh_token.ok_or_else(|| {
-            LauncherError::Message("MSA 响应缺少 refresh_token（scope 是否漏了 offline_access？）".into())
+            LauncherError::Message(
+                "MSA 响应缺少 refresh_token（scope 是否漏了 offline_access？）".into(),
+            )
         })?,
         expires_at: now_secs() + body.expires_in,
     })
@@ -247,10 +250,9 @@ fn token_from_body(body: MsaTokenResponse) -> Result<MsaToken> {
 
 async fn parse_msa_response(resp: reqwest::Response) -> Result<MsaToken> {
     let status = resp.status();
-    let body: MsaTokenResponse = resp
-        .json()
-        .await
-        .map_err(|e| LauncherError::Message(format!("MSA token 响应解析失败 (HTTP {status}): {e}")))?;
+    let body: MsaTokenResponse = resp.json().await.map_err(|e| {
+        LauncherError::Message(format!("MSA token 响应解析失败 (HTTP {status}): {e}"))
+    })?;
     token_from_body(body)
 }
 
@@ -271,9 +273,7 @@ pub async fn xbl_xsts(msa_access_token: &str) -> Result<(String, String)> {
         .send()
         .await?
         .error_for_status()
-        .map_err(|e| {
-            LauncherError::Message(format!("XBL user token 获取失败: {e}"))
-        })?;
+        .map_err(|e| LauncherError::Message(format!("XBL user token 获取失败: {e}")))?;
     let user: XblTokenResponse = resp.json().await?;
     let uhs = user
         .display_claims

@@ -17,7 +17,7 @@ use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -26,8 +26,21 @@ use tokio_util::sync::CancellationToken;
 
 static SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
 static TASK_SEQ: AtomicU64 = AtomicU64::new(1);
+/// 目标文件 -> 正在写它的任务：同一路径并发下载会互相覆盖 .part，必须去重
+static ACTIVE_DESTS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+
+fn active_dests() -> &'static Mutex<HashMap<PathBuf, String>> {
+    ACTIVE_DESTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 const MAX_ATTEMPTS: u32 = 3;
+
+/// 超过这个尺寸才考虑分片下载（小文件建连成本占主导，分片反而更慢）
+const SEGMENT_THRESHOLD: u64 = 4 * 1024 * 1024;
+/// 每片最小字节数，避免切出一堆只有几百 KB 的碎片
+const MIN_SEGMENT_SIZE: u64 = 1024 * 1024;
+/// 分片数上限（再多连接收益递减，还容易被 CDN 限流）
+const MAX_SEGMENTS: u64 = 8;
 
 /// 全局并发上限（兜底）。实际并发由调用方控制（设置里的 download_concurrency
 /// 上限 16），这里只防止异常路径把连接数顶爆。
@@ -125,6 +138,16 @@ pub fn start_task(
     sha1: Option<String>,
     origin: Option<manifest::Origin>,
 ) -> String {
+    // 同一目标文件已有任务在跑：直接复用，避免连点产生多个任务把同一个 .part 写坏
+    if let Some(existing) = active_dests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&dest)
+        .cloned()
+    {
+        return existing;
+    }
+
     let task_id = new_task_id("dl");
     let token = CancellationToken::new();
 
@@ -137,10 +160,28 @@ pub fn start_task(
             .insert(task_id.clone(), token.clone());
     }
 
+    active_dests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(dest.clone(), task_id.clone());
+
+    // 立刻推一条「0 字节」的进度：前端点完下载马上就能看到任务卡片，
+    // 不用等网络探速/首包到达（GitHub 慢的时候这段可能有好几秒）。
+    push(DownloadProgress {
+        task_id: task_id.clone(),
+        name: name.to_string(),
+        downloaded: 0,
+        total: 0,
+        speed_bps: 0,
+        state: "running".into(),
+        error: None,
+    });
+
     let app = app.clone();
     let name = name.to_string();
     let url = url.to_string();
     let task_id_inner = task_id.clone();
+    let dest_for_map = dest.clone();
     let file_name = dest
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -166,7 +207,15 @@ pub fn start_task(
 
         // 终态进度由 run_download_full 统一发（内部下载与后台任务共用同一套收尾）
 
-        app.state::<AppState>().cancels.lock().unwrap().remove(&task_id);
+        app.state::<AppState>()
+            .cancels
+            .lock()
+            .unwrap()
+            .remove(&task_id);
+        active_dests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&dest_for_map);
     });
 
     task_id
@@ -191,9 +240,11 @@ pub async fn run_download(
     sha1_hex: Option<&str>,
     token: &CancellationToken,
 ) -> Result<PathBuf> {
-    Ok(run_download_full(app, task_id, name, url, dest, sha1_hex, token)
-        .await?
-        .path)
+    Ok(
+        run_download_full(app, task_id, name, url, dest, sha1_hex, token)
+            .await?
+            .path,
+    )
 }
 
 /// 同 `run_download`，但把大小与 sha1 一并返回（写下载清单用）。
@@ -277,6 +328,8 @@ async fn retry_download(
                 last_err = Some(e); // 校验失败重下也没有意义差异，但保留统一重试路径
             }
             Err(e) => {
+                // 网络类失败：让下次重试重新测速，可能换一条更稳的线路
+                crate::mirror::forget(url);
                 last_err = Some(e);
                 if attempt < MAX_ATTEMPTS {
                     tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
@@ -285,8 +338,7 @@ async fn retry_download(
         }
     }
 
-    Err(last_err
-        .unwrap_or_else(|| LauncherError::Message("下载失败（未知原因）".into())))
+    Err(last_err.unwrap_or_else(|| LauncherError::Message("下载失败（未知原因）".into())))
 }
 
 async fn download_once(
@@ -309,7 +361,37 @@ async fn download_once(
         resume_from = tokio::fs::metadata(&part).await?.len();
     }
 
-    let mut req = net::get().get(url);
+    // GitHub 直连在国内常被限速：先并发测速挑最快线路（含直连与公共镜像），
+    // 非 GitHub 地址原样返回，不影响其它下载源。
+    let resolved = crate::mirror::resolve(url).await;
+    if token.is_cancelled() {
+        return Err(LauncherError::Cancelled);
+    }
+
+    // 大文件（客户端 jar）在全新下载时走多连接分片，能明显吃满带宽；
+    // 断点续传仍走单连接（.part 里已有内容，分片拼接会破坏续传语义）。
+    if resume_from == 0
+        && crate::mirror::is_github(url)
+        && let Some(total) = probe_total(&resolved).await
+        && total >= SEGMENT_THRESHOLD
+    {
+        match download_segmented(app, task_id, name, &resolved, dest, sha1_hex, token, total).await
+        {
+            Ok(done) => return Ok(done),
+            Err(LauncherError::Cancelled) => return Err(LauncherError::Cancelled),
+            // 镜像不支持 Range / 分片中途失败：静默回退单连接，
+            // 不走重试循环，避免「明明能下却报分片失败」
+            Err(_) => {}
+        }
+        if token.is_cancelled() {
+            return Err(LauncherError::Cancelled);
+        }
+    }
+
+    let mut req = net::get()
+        .get(&resolved)
+        // 明确要求不压缩：保证 Content-Length 与 Range 语义可靠
+        .header("Accept-Encoding", "identity");
     if resume_from > 0 {
         req = req.header("Range", format!("bytes={resume_from}-"));
     }
@@ -349,8 +431,7 @@ async fn download_once(
         window_downloaded += chunk.len() as u64;
 
         if last_emit.elapsed() >= Duration::from_millis(100) {
-            let pct_changed = total == 0
-                || (downloaded - last_downloaded) * 100 / total >= 1;
+            let pct_changed = total == 0 || (downloaded - last_downloaded) * 100 / total >= 1;
             if pct_changed {
                 if let Some(tid) = task_id {
                     let speed = (window_downloaded as f64
@@ -383,23 +464,230 @@ async fn download_once(
         return Err(LauncherError::Cancelled);
     }
 
+    finish_file(part, dest, sha1_hex, downloaded).await
+}
+
+/// 校验 + 落盘（单连接与分片下载共用收尾）
+async fn finish_file(
+    part: PathBuf,
+    dest: &Path,
+    sha1_hex: Option<&str>,
+    size: u64,
+) -> Result<Downloaded> {
     // 无论调用方是否给了期望值都算一遍：算出来的 hash 要写进下载清单，
     // 有期望值时顺带校验。资源类下载本就带 sha1，不会多读一次文件。
     let actual = file_sha1(&part).await?;
-    if let Some(expected) = sha1_hex {
-        if !actual.eq_ignore_ascii_case(expected) {
-            return Err(LauncherError::Checksum(format!(
-                "sha1 校验失败：期望 {expected}，实际 {actual}"
-            )));
-        }
+    if let Some(expected) = sha1_hex
+        && !actual.eq_ignore_ascii_case(expected)
+    {
+        return Err(LauncherError::Checksum(format!(
+            "sha1 校验失败：期望 {expected}，实际 {actual}"
+        )));
     }
 
     tokio::fs::rename(&part, dest).await?;
     Ok(Downloaded {
         path: dest.to_path_buf(),
-        size: downloaded,
+        size,
         sha1: actual,
     })
+}
+
+/// 探测服务端是否支持 Range 以及文件总大小（`Range: bytes=0-0`）
+///
+/// 只等响应头，不读正文；加超时是为了不让慢线路把「开始下载」拖成几十秒。
+async fn probe_total(url: &str) -> Option<u64> {
+    tokio::time::timeout(Duration::from_secs(6), async {
+        let resp = net::get()
+            .get(url)
+            .header("Range", "bytes=0-0")
+            .header("Accept-Encoding", "identity")
+            .send()
+            .await
+            .ok()?;
+        if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            return None;
+        }
+        let range = resp
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)?
+            .to_str()
+            .ok()?;
+        // 形如 `bytes 0-0/123456`
+        range.rsplit('/').next()?.trim().parse().ok()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// 多连接分片下载：把文件切成 N 段并发拉取，最后拼接。
+///
+/// 单连接受限于「每连接限速」时（GitHub 及其镜像很常见）提升非常明显；
+/// 每个分片都校验返回码与长度，任何一片失败就整体重试（.part 会被清掉）。
+#[allow(clippy::too_many_arguments)]
+async fn download_segmented(
+    app: &AppHandle,
+    task_id: Option<&str>,
+    name: &str,
+    url: &str,
+    dest: &Path,
+    sha1_hex: Option<&str>,
+    token: &CancellationToken,
+    total: u64,
+) -> Result<Downloaded> {
+    let wanted = app
+        .state::<AppState>()
+        .settings_snapshot()
+        .download_concurrency
+        .clamp(2, 16) as u64;
+    let seg_count = wanted
+        .min(MAX_SEGMENTS)
+        .min((total / MIN_SEGMENT_SIZE).max(1));
+    let chunk = total.div_ceil(seg_count);
+
+    let progress = Arc::new(AtomicU64::new(0));
+
+    // 进度上报：分片内部只累加原子计数，由独立任务每 100ms 汇总一次
+    let ticker = task_id.map(|tid| {
+        let tid = tid.to_string();
+        let name = name.to_string();
+        let progress = progress.clone();
+        tokio::spawn(async move {
+            let mut last = 0u64;
+            let mut last_at = Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let cur = progress.load(Ordering::Relaxed);
+                let speed = (cur.saturating_sub(last) as f64
+                    / last_at.elapsed().as_secs_f64().max(0.05)) as u64;
+                push(DownloadProgress {
+                    task_id: tid.clone(),
+                    name: name.clone(),
+                    downloaded: cur,
+                    total,
+                    speed_bps: speed,
+                    state: "running".into(),
+                    error: None,
+                });
+                last = cur;
+                last_at = Instant::now();
+            }
+        })
+    });
+
+    let mut jobs = Vec::new();
+    let mut seg_paths = Vec::new();
+    for i in 0..seg_count {
+        let start = chunk * i;
+        if start >= total {
+            break;
+        }
+        let end = (start + chunk).min(total) - 1;
+        let seg_path = dest.with_extension(format!("part.{i}"));
+        seg_paths.push(seg_path.clone());
+        jobs.push(tokio::spawn(fetch_segment(
+            url.to_string(),
+            start,
+            end,
+            seg_path,
+            progress.clone(),
+            token.clone(),
+        )));
+    }
+
+    let mut failure: Option<LauncherError> = None;
+    for job in jobs {
+        match job.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                failure.get_or_insert(e);
+            }
+            Err(e) => {
+                failure.get_or_insert(LauncherError::Message(format!("分片任务异常: {e}")));
+            }
+        }
+    }
+    if let Some(t) = ticker {
+        t.abort();
+    }
+
+    if let Some(e) = failure {
+        for p in &seg_paths {
+            let _ = tokio::fs::remove_file(p).await;
+        }
+        return Err(e);
+    }
+    if token.is_cancelled() {
+        for p in &seg_paths {
+            let _ = tokio::fs::remove_file(p).await;
+        }
+        return Err(LauncherError::Cancelled);
+    }
+
+    // 按顺序拼接分片
+    let part = dest.with_extension("part");
+    {
+        let mut out = tokio::fs::File::create(&part).await?;
+        for p in &seg_paths {
+            let mut f = tokio::fs::File::open(p).await?;
+            tokio::io::copy(&mut f, &mut out).await?;
+            let _ = tokio::fs::remove_file(p).await;
+        }
+        out.flush().await?;
+    }
+
+    finish_file(part, dest, sha1_hex, total).await
+}
+
+/// 下载单个分片；长度不符直接判失败，避免拼出损坏文件
+async fn fetch_segment(
+    url: String,
+    start: u64,
+    end: u64,
+    path: PathBuf,
+    progress: Arc<AtomicU64>,
+    token: CancellationToken,
+) -> Result<()> {
+    if token.is_cancelled() {
+        return Err(LauncherError::Cancelled);
+    }
+
+    let resp = net::get()
+        .get(&url)
+        .header("Range", format!("bytes={start}-{end}"))
+        .header("Accept-Encoding", "identity")
+        .send()
+        .await?
+        .error_for_status()?;
+    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(LauncherError::Message(
+            "服务器不支持分片下载，已回退单连接".into(),
+        ));
+    }
+
+    let mut file = tokio::fs::File::create(&path).await?;
+    let mut got = 0u64;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = token
+        .run_until_cancelled(stream.next())
+        .await
+        .ok_or(LauncherError::Cancelled)?
+        .transpose()?
+    {
+        file.write_all(&chunk).await?;
+        got += chunk.len() as u64;
+        progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+    }
+    file.flush().await?;
+
+    let expected = end - start + 1;
+    if got != expected {
+        return Err(LauncherError::Message(format!(
+            "分片下载不完整（{got}/{expected}）"
+        )));
+    }
+    Ok(())
 }
 
 /// 流式计算 sha1（同步版）：按 64KB 分块读，避免把整个 jar 读进内存。
@@ -408,6 +696,23 @@ pub fn sha1_file_sync(path: &Path) -> Result<String> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha1::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// 流式计算 sha256（同步版）：Adoptium JRE zip 的官方 checksum 用，逻辑同 sha1。
+pub fn sha256_file_sync(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = file.read(&mut buf)?;

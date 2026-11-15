@@ -13,7 +13,6 @@
  * 窗口为 transparent:true + DWM 亚克力。
  * 根节点必须是全透明的，否则不透明底会把亚克力整块盖住；
  * 氛围渐变与半透明压暗层挪到 +layout.svelte 的 .shell 上。
- * （原来的 background-attachment: fixed 会让视口重复重绘，已删除）
  */
 html,
 body {
@@ -55,11 +54,11 @@ button {
   height: 8px;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.14);
+  background: rgba(127, 137, 132, 0.28);
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.24);
+  background: rgba(127, 137, 132, 0.45);
 }
 ::-webkit-scrollbar-track {
   background: transparent;
@@ -67,22 +66,29 @@ button {
 
 /* 通用控件 */
 .btn {
+  position: relative;
+  overflow: hidden;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
   padding: 8px 16px;
   border-radius: var(--radius-sm);
-  background: var(--card);
+  background: var(--window-strong);
   border: 1px solid var(--line);
   color: var(--text);
   font-size: 13px;
   transition:
-    background 0.15s,
-    border-color 0.15s;
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out);
 }
 .btn:hover:not(:disabled) {
   background: var(--card-hover);
+  border-color: var(--accent-soft);
+}
+.btn:active:not(:disabled) {
+  transform: scale(0.98);
 }
 .btn:disabled {
   opacity: 0.45;
@@ -90,28 +96,86 @@ button {
 }
 .btn.primary {
   background: var(--accent-soft);
-  border-color: rgba(7, 152, 252, 0.45);
+  border-color: var(--accent-strong);
   color: var(--accent);
 }
 .btn.primary:hover:not(:disabled) {
-  background: rgba(7, 152, 252, 0.26);
+  background: var(--accent-strong);
 }
 
-.card {
+/* 浮岛：大圆角 + 阴影悬浮，边框只做极弱分隔（亚克力下必须带 alpha） */
+.card,
+.island {
   background: var(--card);
+  border-radius: var(--radius-card);
   border: 1px solid var(--line);
-  border-radius: var(--radius);
+  box-shadow: var(--shadow-1);
+}
+.island.clickable,
+.card.clickable {
+  cursor: pointer;
+  transition:
+    transform var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out);
+}
+.island.clickable:hover,
+.card.clickable:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-2);
+  background: var(--card-hover);
 }
 
 .input {
-  background: rgba(8, 8, 12, 0.45);
+  background: var(--window);
   border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius);
   color: var(--text);
   padding: 8px 10px;
   font-size: 13px;
   outline: none;
+  transition:
+    border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out);
 }
 .input:focus {
-  border-color: rgba(7, 152, 252, 0.5);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* 点击涟漪：由 lib/utils/ripple.ts 动态挂到按钮内，父容器需 relative + overflow:hidden */
+.ripple {
+  position: absolute;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.18;
+  transform: scale(0);
+  pointer-events: none;
+  animation: ripple 450ms var(--ease-out) forwards;
+}
+@keyframes ripple {
+  to {
+    transform: scale(2.5);
+    opacity: 0;
+  }
+}
+
+/* 主题切换时的全局渐变（由 theme store 临时挂 html.theme-anim） */
+html.theme-anim,
+html.theme-anim *,
+html.theme-anim *::before,
+html.theme-anim *::after {
+  transition:
+    background-color var(--dur-slow) var(--ease-out),
+    color var(--dur-slow) var(--ease-out),
+    border-color var(--dur-slow) var(--ease-out),
+    box-shadow var(--dur-slow) var(--ease-out),
+    fill var(--dur-slow) var(--ease-out),
+    stroke var(--dur-slow) var(--ease-out) !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ripple {
+    display: none;
+  }
 }

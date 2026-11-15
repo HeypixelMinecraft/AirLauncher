@@ -9,7 +9,6 @@ use crate::download;
 use crate::error::{LauncherError, Result};
 use crate::paths;
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
 
 const API: &str = "https://api.modrinth.com/v2";
 const MC_VERSION: &str = "1.8.9";
@@ -79,9 +78,7 @@ struct ProjectVersion {
 }
 
 fn facets() -> String {
-    format!(
-        r#"[["versions:{MC_VERSION}"],["categories:forge"]]"#
-    )
+    format!(r#"[["versions:{MC_VERSION}"],["categories:forge"]]"#)
 }
 
 #[tauri::command]
@@ -205,7 +202,7 @@ pub async fn mods_list() -> Result<Vec<ModFile>> {
                 size: entry.metadata().map(|m| m.len()).unwrap_or(0),
             });
         }
-        list.sort_by(|a, b| a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()));
+        list.sort_by_key(|f| f.file_name.to_lowercase());
         Ok(list)
     })
     .await

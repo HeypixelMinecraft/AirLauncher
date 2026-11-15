@@ -24,6 +24,9 @@ use tokio_util::sync::CancellationToken;
 const CLIENT_PREFIX: &str = "airplus";
 
 fn emit_log(app: &AppHandle, msg: &str) {
+    if crate::warmup::active() {
+        return; // 预热不打扰主界面日志
+    }
     let _ = app.emit(events::LAUNCH_LOG, msg.to_string());
 }
 

@@ -56,7 +56,16 @@ export function onLaunchLog(cb: (line: string) => void): Promise<UnlistenFn> {
   return listen<string>("launch://log", (e) => cb(e.payload));
 }
 
-/** payload 为错误信息；null 表示正常结束 */
-export function onLaunchExit(cb: (error: string | null) => void): Promise<UnlistenFn> {
-  return listen<string | null>("launch://exit", (e) => cb(e.payload));
+/** launch://exit 载荷：error = 启动流程失败原因；exitCode = 游戏进程退出码 */
+export interface LaunchExitPayload {
+  error: string | null;
+  exitCode: number | null;
+}
+
+/**
+ * 正常结束 {error: null, exitCode: 0}；游戏崩溃时 exitCode 非 0，
+ * 前端据此引导用户去看日志。
+ */
+export function onLaunchExit(cb: (payload: LaunchExitPayload) => void): Promise<UnlistenFn> {
+  return listen<LaunchExitPayload>("launch://exit", (e) => cb(e.payload));
 }

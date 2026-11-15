@@ -3,36 +3,90 @@
  * A Tauri-based launcher for the AirPlus Minecraft client.
  * https://github.com/lmx0721/AirPlus
  *
- * 色板取自客户端 ThemeSelector.kt 的深色毛玻璃配色。
- * 窗口为 transparent + DWM 亚克力，色值必须带 alpha，
+ * 方案「浮岛 Isles」设计 token。
+ * 窗口为 transparent + DWM 亚克力，窗口/卡片色必须带 alpha，
  * 否则内容层会把亚克力整块盖住（看起来和 opaque 一模一样）。
+ * 色相统一向灰绿偏移，单一强调色为薄荷 #2dd4a7。
  */
 :root {
-  --overlay: rgba(8, 8, 12, 0.62);
-  --window: rgba(12, 12, 17, 0.52);
-  --window-strong: rgba(16, 16, 22, 0.6);
-  --card: rgba(35, 34, 39, 0.72);
-  --card-hover: rgba(46, 44, 51, 0.82);
-  --text: #eae7e2;
-  --text-muted: rgba(255, 255, 255, 0.42);
-  --line: rgba(255, 255, 255, 0.1);
-  --accent: #0798fc;
-  --accent-soft: rgba(7, 152, 252, 0.16);
+  --overlay: rgba(10, 14, 13, 0.66);
+  --window: rgba(15, 20, 18, 0.52);
+  --window-strong: rgba(19, 25, 23, 0.62);
+  --card: rgba(19, 25, 23, 0.6);
+  --card-hover: rgba(28, 36, 33, 0.72);
+  --text: #e8f0ed;
+  --text-muted: rgba(232, 240, 237, 0.45);
+  --line: rgba(255, 255, 255, 0.08);
+  --accent: #2dd4a7;
+  --accent-soft: rgba(45, 212, 167, 0.14);
+  --accent-strong: rgba(45, 212, 167, 0.3);
+  --accent-contrast: #06251c;
   --danger: #e5484d;
   --ok: #46a758;
+
+  /* .shell 氛围光（两色共用一组，浅色主题下调淡） */
+  --glow-a: rgba(45, 212, 167, 0.1);
+  --glow-b: rgba(45, 212, 167, 0.07);
+
+  --radius-card: 16px;
   --radius: 10px;
-  --radius-sm: 6px;
+  --radius-sm: 8px;
+  --radius-full: 999px;
+
+  --shadow-1: 0 2px 10px rgba(0, 0, 0, 0.18), 0 0 1px rgba(0, 0, 0, 0.25);
+  --shadow-2: 0 8px 28px rgba(0, 0, 0, 0.3), 0 0 1px rgba(0, 0, 0, 0.3);
+  --shadow-accent: 0 4px 18px rgba(45, 212, 167, 0.35);
+
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --dur-fast: 150ms;
+  --dur: 260ms;
+  --dur-slow: 450ms;
+
   --font:
     "Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI",
     "Microsoft YaHei", system-ui, sans-serif;
 }
 
+/* 浅色主题：变量名完全一致，由 +layout 在 <html> 上打 data-theme="light" */
+:root[data-theme="light"] {
+  --overlay: rgba(243, 247, 245, 0.7);
+  --window: rgba(255, 255, 255, 0.48);
+  --window-strong: rgba(255, 255, 255, 0.6);
+  --card: rgba(255, 255, 255, 0.62);
+  --card-hover: rgba(255, 255, 255, 0.8);
+  --text: #1a2420;
+  --text-muted: rgba(26, 36, 32, 0.55);
+  --line: rgba(0, 0, 0, 0.08);
+  --accent: #0da271;
+  --accent-soft: rgba(13, 162, 113, 0.12);
+  --accent-strong: rgba(13, 162, 113, 0.24);
+  --accent-contrast: #ffffff;
+  --danger: #d93036;
+  --ok: #2f9e4f;
+
+  --glow-a: rgba(45, 212, 167, 0.05);
+  --glow-b: rgba(45, 212, 167, 0.035);
+
+  --shadow-1: 0 2px 10px rgba(23, 42, 36, 0.1), 0 0 1px rgba(23, 42, 36, 0.14);
+  --shadow-2: 0 8px 24px rgba(23, 42, 36, 0.16), 0 0 1px rgba(23, 42, 36, 0.18);
+  --shadow-accent: 0 4px 16px rgba(13, 162, 113, 0.3);
+}
+
 /* 回退：设置里选「不透明」时由 JS 在 <html> 上打 data-window-effect="none"。
-   此时 DWM 效果已被移除，必须给回纯色底，否则窗口背景直接漏出桌面。 */
+   此时 DWM 效果已被移除，必须给回纯色底，否则窗口背景直接漏出桌面。
+   需与深浅主题叠加成四象限。 */
 :root[data-window-effect="none"] {
-  --overlay: #08080c;
-  --window: #16151a;
-  --window-strong: #1b1a1f;
-  --card: #232227;
-  --card-hover: #2e2c33;
+  --overlay: #0c110f;
+  --window: #141a18;
+  --window-strong: #18201d;
+  --card: #1a221f;
+  --card-hover: #232d29;
+}
+:root[data-theme="light"][data-window-effect="none"] {
+  --overlay: #eef2f0;
+  --window: #f7faf9;
+  --window-strong: #ffffff;
+  --card: #ffffff;
+  --card-hover: #f0f5f3;
 }

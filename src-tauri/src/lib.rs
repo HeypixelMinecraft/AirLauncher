@@ -14,12 +14,14 @@ mod github;
 mod java;
 mod launch;
 mod manifest;
+mod mirror;
 mod modrinth;
 mod mojang;
 mod net;
 mod optifine;
 mod paths;
 mod state;
+mod warmup;
 
 use config::Settings;
 use error::Result;
@@ -61,6 +63,48 @@ async fn settings_get(state: tauri::State<'_, AppState>) -> Result<Settings> {
     Ok(state.settings_snapshot())
 }
 
+/// 用系统浏览器打开链接（如 bilibili 主页）。
+/// 同样走 Rust 侧 opener，不依赖前端插件的 ACL 配置。
+#[tauri::command]
+async fn open_url(app: tauri::AppHandle, url: String) -> Result<()> {
+    use tauri_plugin_opener::OpenerExt;
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(error::LauncherError::Message(
+            "只允许打开 http/https 链接".into(),
+        ));
+    }
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| error::LauncherError::Message(format!("打开链接失败: {e}")))
+}
+
+/// 切换数据目录：搬走现有数据并写入引导文件，重启后生效。
+#[tauri::command]
+async fn data_dir_set(path: String) -> Result<String> {
+    tauri::async_runtime::spawn_blocking(move || paths::set_data_dir(&path))
+        .await
+        .map_err(|e| error::LauncherError::Message(format!("切换数据目录失败: {e}")))?
+        .map(|p| p.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn data_dir_reset() -> Result<String> {
+    tauri::async_runtime::spawn_blocking(paths::reset_data_dir)
+        .await
+        .map_err(|e| error::LauncherError::Message(format!("恢复默认目录失败: {e}")))?
+        .map(|p| p.to_string_lossy().to_string())
+}
+
+/// 重启启动器（切换数据目录后让新路径生效）
+#[tauri::command]
+async fn app_restart(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        // 给前端一点时间把 IPC 响应与提示画完
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        app.restart();
+    });
+}
+
 /// 保存设置。落盘是同步 IO，下沉到阻塞线程池，避免卡住主线程。
 #[tauri::command]
 async fn settings_set(state: tauri::State<'_, AppState>, settings: Settings) -> Result<()> {
@@ -71,6 +115,70 @@ async fn settings_set(state: tauri::State<'_, AppState>, settings: Settings) -> 
     tauri::async_runtime::spawn_blocking(move || settings.save(&paths::get().settings_file))
         .await
         .map_err(|e| error::LauncherError::Message(format!("保存设置失败: {e}")))?
+}
+
+// ---------- Java ----------
+
+/// 手动触发一次系统 Java 全量扫描（绕过并刷新缓存）。
+/// Java 8 与其它版本（11/17/21…）分开报告：让「装了 Java 17 没有 Java 8」的
+/// 用户明白会自动下载，而不是误以为检测失败。
+#[tauri::command]
+async fn java_detect() -> Result<java::DetectResult> {
+    Ok(java::detect_system_java_fresh().await)
+}
+
+/// 当前生效的 Java（主页 / 设置页展示）。只做本地解析，不触发下载。
+#[tauri::command]
+async fn java_status(app: tauri::AppHandle) -> Result<java::JavaStatus> {
+    Ok(java::status(&app).await)
+}
+
+/// 物理内存总量 (MB)。设置页保存内存时校验用；拿不到（非 Windows）返回 null。
+#[tauri::command]
+async fn system_total_memory_mb() -> Option<u64> {
+    total_physical_memory_mb()
+}
+
+#[cfg(windows)]
+fn total_physical_memory_mb() -> Option<u64> {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(buf: *mut MemoryStatusEx) -> i32;
+    }
+
+    let mut info = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    if unsafe { GlobalMemoryStatusEx(&mut info) } != 0 {
+        Some(info.total_phys / 1024 / 1024)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(windows))]
+fn total_physical_memory_mb() -> Option<u64> {
+    None
 }
 
 // ---------- 下载 / GitHub ----------
@@ -230,14 +338,23 @@ pub fn run() {
             download::spawn_progress_flusher(handle.clone());
             // 启动时把下载清单与 mods 目录对齐（present / active 标记）
             tauri::async_runtime::spawn_blocking(manifest::sync);
+            // 空闲几秒后预热启动流程（Java 扫描、Forge/库/资源检查）
+            warmup::spawn(handle.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             paths_get,
             open_path,
+            open_url,
             settings_get,
             settings_set,
+            data_dir_set,
+            data_dir_reset,
+            app_restart,
             window_set_effect,
+            java_detect,
+            java_status,
+            system_total_memory_mb,
             github_list_releases,
             github_download_asset,
             client::client_activate,

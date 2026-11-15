@@ -1,5 +1,11 @@
 <script lang="ts">
-  import { listReleases, downloadAsset, type GhRelease, type GhAsset } from "$lib/api/github";
+  import {
+    listReleases,
+    downloadAsset,
+    downloadCancel,
+    type GhRelease,
+    type GhAsset,
+  } from "$lib/api/github";
   import { downloads, formatBytes } from "$lib/stores/downloads.svelte";
   import { marked } from "marked";
   import DOMPurify from "dompurify";
@@ -8,6 +14,13 @@
   let loading = $state(true);
   let loadError = $state<string | null>(null);
   let selectedTag = $state<string | null>(null);
+
+  /**
+   * 点击「下载」后本地先标记为下载中：
+   * 后端要等测速/首包才有进度事件，直接依赖事件会让按钮在几百毫秒内还是「下载」，
+   * 用户以为没点到就会连点好几次，触发多个重复任务。
+   */
+  let starting = $state<Record<string, boolean>>({});
 
   let { active = false } = $props();
   let lastLoaded = 0;
@@ -43,8 +56,20 @@
     }
   }
 
-  function install(asset: GhAsset, tag: string) {
-    void downloadAsset(asset, tag);
+  async function install(asset: GhAsset, tag: string) {
+    if (starting[asset.name]) return;
+    starting[asset.name] = true;
+    try {
+      await downloadAsset(asset, tag);
+    } catch {
+      // 启动任务失败：立刻放开按钮，具体错误由下方任务条/日志承担
+      starting[asset.name] = false;
+      return;
+    }
+    // 任务已在后端排队，等进度事件接管即可；这里兜底清理，避免标记残留
+    window.setTimeout(() => {
+      starting[asset.name] = false;
+    }, 3000);
   }
 
   $effect(() => {
@@ -55,6 +80,10 @@
 </script>
 
 <div class="page">
+  <header class="page-head">
+    <h2>版本</h2>
+    <button class="btn" onclick={load} disabled={loading}>刷新</button>
+  </header>
   {#if loading}
     <p class="muted">正在加载版本列表…</p>
   {:else if loadError}
@@ -67,7 +96,7 @@
       <aside class="list">
         {#each releases as r (r.tag_name)}
           <button
-            class="rel"
+            class="rel island clickable"
             class:active={selectedTag === r.tag_name}
             onclick={() => (selectedTag = r.tag_name)}
           >
@@ -80,7 +109,7 @@
         {/each}
       </aside>
 
-      <section class="detail card">
+      <section class="detail island">
         {#each releases.filter((r) => r.tag_name === selectedTag) as r (r.tag_name)}
           <h2>{r.name ?? r.tag_name}</h2>
 
@@ -91,7 +120,23 @@
                 <span class="aname" title={asset.name}>{asset.name}</span>
                 <span class="asize">{formatBytes(asset.size)}</span>
                 {#if task?.state === "running"}
-                  <span class="dlmeta">{formatBytes(task.downloaded)} / {formatBytes(task.total)}</span>
+                  <span class="dlmeta">
+                    <span class="spin"></span>
+                    {#if task.total > 0}
+                      {formatBytes(task.downloaded)} / {formatBytes(task.total)}
+                      {#if task.speedBps > 0}· {formatBytes(task.speedBps)}/s{/if}
+                    {:else}
+                      准备中…
+                    {/if}
+                  </span>
+                  <button class="btn ghost" onclick={() => downloadCancel(task.taskId)}>取消</button>
+                {:else if task?.state === "error"}
+                  <span class="dlmeta err" title={task.error ?? ""}>
+                    下载失败{task.error ? `：${task.error}` : ""}
+                  </span>
+                  <button class="btn" onclick={() => install(asset, r.tag_name)}>重试</button>
+                {:else if starting[asset.name]}
+                  <span class="dlmeta"><span class="spin"></span>准备中…</span>
                 {:else}
                   <button class="btn" onclick={() => install(asset, r.tag_name)}>下载</button>
                 {/if}
@@ -114,6 +159,18 @@
     height: 100%;
     display: flex;
     flex-direction: column;
+    gap: 14px;
+  }
+  .page-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .page-head h2 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 600;
   }
   .muted {
     color: var(--text-muted);
@@ -138,7 +195,7 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
-    padding-right: 2px;
+    padding: 2px 2px 2px 0;
   }
   .rel {
     display: flex;
@@ -146,16 +203,10 @@
     gap: 2px;
     text-align: left;
     padding: 10px 12px;
-    border-radius: var(--radius-sm);
-    border: 1px solid var(--line);
-    background: rgba(8, 8, 12, 0.3);
     color: var(--text);
   }
-  .rel:hover {
-    background: var(--card-hover);
-  }
   .rel.active {
-    border-color: rgba(7, 152, 252, 0.5);
+    border-color: var(--accent-strong);
     background: var(--accent-soft);
   }
   .tag {
@@ -169,9 +220,9 @@
     font-style: normal;
     font-size: 10px;
     color: var(--accent);
-    border: 1px solid rgba(7, 152, 252, 0.4);
-    border-radius: 4px;
-    padding: 0 5px;
+    border: 1px solid var(--accent-strong);
+    border-radius: var(--radius-full);
+    padding: 0 6px;
   }
   .date {
     font-size: 11px;
@@ -183,7 +234,7 @@
     overflow-y: auto;
     padding: 20px 22px;
   }
-  h2 {
+  .detail h2 {
     margin: 0 0 14px;
     font-size: 18px;
   }
@@ -202,8 +253,8 @@
     align-items: center;
     gap: 12px;
     padding: 8px 12px;
-    border-radius: var(--radius-sm);
-    background: rgba(8, 8, 12, 0.35);
+    border-radius: var(--radius);
+    background: var(--window);
     border: 1px solid var(--line);
   }
   .aname {
@@ -219,12 +270,46 @@
   }
   .dlmeta {
     margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     font-size: 11px;
     color: var(--accent);
+  }
+  .dlmeta.err {
+    color: var(--danger);
+    max-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* 下载中的小转圈，点击后立刻可见 */
+  .spin {
+    width: 10px;
+    height: 10px;
+    flex: none;
+    border-radius: 50%;
+    border: 1.5px solid var(--accent-soft);
+    border-top-color: var(--accent);
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .spin {
+      animation: none;
+    }
   }
   .asset .btn {
     margin-left: auto;
     padding: 4px 14px;
+  }
+  .asset .btn.ghost {
+    margin-left: 0;
+    color: var(--text-muted);
   }
   .changelog {
     user-select: text;
@@ -233,15 +318,15 @@
     line-height: 1.6;
   }
   .changelog :global(code) {
-    background: rgba(8, 8, 12, 0.5);
+    background: var(--window);
     padding: 1px 5px;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     font-size: 12px;
   }
   .changelog :global(pre) {
-    background: rgba(8, 8, 12, 0.5);
+    background: var(--window);
     padding: 10px 12px;
-    border-radius: var(--radius-sm);
+    border-radius: var(--radius);
     overflow-x: auto;
   }
   .changelog :global(a) {

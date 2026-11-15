@@ -12,7 +12,7 @@ use crate::download::DownloadProgress;
 use crate::error::{LauncherError, Result};
 use crate::events;
 use crate::paths;
-use futures_util::{stream, StreamExt, TryStreamExt};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,7 +32,10 @@ pub fn map_url(url: &str, mirror: Option<&str>) -> String {
             .replace("https://piston-meta.mojang.com", m)
             .replace("https://launchermeta.mojang.com", m)
             .replace("https://libraries.minecraft.net", &format!("{m}/maven"))
-            .replace("https://resources.download.minecraft.net", &format!("{m}/assets"))
+            .replace(
+                "https://resources.download.minecraft.net",
+                &format!("{m}/assets"),
+            )
             .replace("https://maven.minecraftforge.net", &format!("{m}/maven")),
         _ => url.to_string(),
     }
@@ -48,8 +51,6 @@ pub struct VersionManifest {
 #[derive(Deserialize)]
 pub struct ManifestVersion {
     pub id: String,
-    #[serde(rename = "type")]
-    pub version_type: String,
     pub url: String,
 }
 
@@ -84,14 +85,14 @@ pub struct VersionProfile {
     pub libraries: Vec<Library>,
     #[serde(rename = "type")]
     pub version_type: Option<String>,
-    pub jar: Option<String>,
 }
 
 impl VersionProfile {
     pub fn load_file(path: &Path) -> Result<VersionProfile> {
         let bytes = std::fs::read(path)?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| LauncherError::Message(format!("版本 JSON 解析失败 {}: {e}", path.display())))
+        serde_json::from_slice(&bytes).map_err(|e| {
+            LauncherError::Message(format!("版本 JSON 解析失败 {}: {e}", path.display()))
+        })
     }
 
     /// 子版本（forge）优先，父版本（vanilla）补充；库按 group:artifact(:classifier) 去重
@@ -271,10 +272,10 @@ fn rule_applies(rule: &Rule) -> bool {
     let Some(os) = &rule.os else {
         return true;
     };
-    if let Some(name) = &os.name {
-        if name != "windows" {
-            return false;
-        }
+    if let Some(name) = &os.name
+        && name != "windows"
+    {
+        return false;
     }
     if let Some(arch) = &os.arch {
         let ok = match arch.as_str() {
@@ -286,10 +287,10 @@ fn rule_applies(rule: &Rule) -> bool {
             return false;
         }
     }
-    if let Some(pattern) = &os.version {
-        if !version_matches(pattern) {
-            return false;
-        }
+    if let Some(pattern) = &os.version
+        && !version_matches(pattern)
+    {
+        return false;
     }
     true
 }
@@ -391,13 +392,48 @@ pub struct Downloads {
 pub struct ClientDownload {
     pub sha1: String,
     pub url: String,
-    pub size: i64,
 }
 
 // ---------- 下载保障（ensure_*） ----------
 
 fn emit_log(app: &AppHandle, msg: &str) {
+    if crate::warmup::active() {
+        return; // 预热不打扰主界面日志
+    }
     let _ = app.emit(events::LAUNCH_LOG, msg.to_string());
+}
+
+/// 加载 Forge 版本 JSON，若有 inheritsFrom 就从 Mojang manifest 找父版本合并。
+/// 启动流程与预热共用。
+pub async fn load_merged_profile(token: &CancellationToken) -> Result<VersionProfile> {
+    let mut profile = VersionProfile::load_file(&crate::forge::version_json_path())?;
+
+    if let Some(parent_id) = profile.inherits_from.clone() {
+        let manifest = fetch_manifest(token).await?;
+        let parent_url = manifest
+            .versions
+            .iter()
+            .find(|v| v.id == parent_id)
+            .map(|v| v.url.clone())
+            .ok_or_else(|| {
+                LauncherError::Message(format!("Mojang 清单中找不到版本 {parent_id}"))
+            })?;
+
+        let resp = token
+            .run_until_cancelled(crate::net::get().get(&parent_url).send())
+            .await
+            .ok_or(LauncherError::Cancelled)?
+            .map_err(|e| LauncherError::Message(format!("父版本 JSON 下载失败: {e}")))?
+            .error_for_status()
+            .map_err(|e| LauncherError::Message(format!("父版本 JSON 请求失败: {e}")))?;
+        let parent: VersionProfile = resp
+            .json()
+            .await
+            .map_err(|e| LauncherError::Message(format!("父版本 JSON 解析失败: {e}")))?;
+        profile.merge(parent);
+        profile.id = crate::forge::version_id();
+    }
+    Ok(profile)
 }
 
 /// 下载全部缺失的库，返回 classpath 条目（不含 natives），并把 natives 解压到位
@@ -407,10 +443,14 @@ pub async fn ensure_libraries(
     token: &CancellationToken,
 ) -> Result<Vec<PathBuf>> {
     let libs_dir = paths::get().libraries_dir();
-    let natives_dir = paths::get().natives_dir("1.8.9");
+    // 版本 id 从版本 JSON 取，不硬编码 "1.8.9"（换版本时不会再漏改）
+    let natives_dir = paths::get().natives_dir(&profile.id);
     tokio::fs::create_dir_all(&natives_dir).await?;
 
-    let mirror = app.state::<crate::state::AppState>().settings_snapshot().mirror;
+    let mirror = app
+        .state::<crate::state::AppState>()
+        .settings_snapshot()
+        .mirror;
     let mirror = mirror.as_deref();
     let task_id = "launch-libs".to_string();
     let total = profile.libraries.len();
@@ -429,10 +469,15 @@ pub async fn ensure_libraries(
                 let dest = libs_dir.join(&info.path);
                 if !dest.exists() {
                     download::fetch_to(
-                        app, &task_id, &lib.name,
-                        &map_url(&info.url, mirror), &dest,
-                        info.sha1.as_deref(), token,
-                    ).await?;
+                        app,
+                        &task_id,
+                        &lib.name,
+                        &map_url(&info.url, mirror),
+                        &dest,
+                        info.sha1.as_deref(),
+                        token,
+                    )
+                    .await?;
                 }
                 native_zips.push(dest);
             }
@@ -442,10 +487,15 @@ pub async fn ensure_libraries(
             let dest = libs_dir.join(&info.path);
             if !dest.exists() {
                 download::fetch_to(
-                    app, &task_id, &lib.name,
-                    &map_url(&info.url, mirror), &dest,
-                    info.sha1.as_deref(), token,
-                ).await?;
+                    app,
+                    &task_id,
+                    &lib.name,
+                    &map_url(&info.url, mirror),
+                    &dest,
+                    info.sha1.as_deref(),
+                    token,
+                )
+                .await?;
             }
             classpath.push(dest);
         }
@@ -569,7 +619,7 @@ pub async fn ensure_assets(
     let done_files = Arc::new(AtomicU64::new(0));
     let failed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let downloads = stream::iter(missing.into_iter()).map(|obj| {
+    let downloads = stream::iter(missing).map(|obj| {
         let app = app.clone();
         let objects_dir = objects_dir.clone();
         let base = base.clone();
@@ -590,7 +640,7 @@ pub async fn ensure_assets(
                     let bytes = done_bytes.fetch_add(size, Ordering::Relaxed) + size;
                     let files = done_files.fetch_add(1, Ordering::Relaxed) + 1;
                     // 每 10 个文件刷新一次整体进度（字节优先；索引缺 size 时退回按文件数）
-                    if files % 10 == 0 || files == total_files {
+                    if files.is_multiple_of(10) || files == total_files {
                         let (downloaded, total) = if total_bytes > 0 {
                             (bytes, total_bytes)
                         } else {
@@ -612,10 +662,7 @@ pub async fn ensure_assets(
                 Err(e) => {
                     // 和 LiquidLauncher 一样：单个资源失败不拖垮整次启动
                     emit_log(&app, &format!("资源 {hash} 下载失败（下次启动重试）：{e}"));
-                    failed
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(hash);
+                    failed.lock().unwrap_or_else(|e| e.into_inner()).push(hash);
                     Ok(())
                 }
             }
@@ -688,8 +735,25 @@ pub async fn ensure_client_jar(
         .versions_dir()
         .join(&profile.id)
         .join(format!("{}.jar", profile.id));
+
+    // 已存在的 jar 也校验一次 sha1：下载中断后的 rename 残留、磁盘坏块
+    // 表现为玄学崩溃，这里用一次廉价的哈希把问题显性化。
     if dest.exists() {
-        return Ok(dest);
+        let expected = client.sha1.clone();
+        let p = dest.clone();
+        let intact = tauri::async_runtime::spawn_blocking(move || {
+            crate::download::sha1_file_sync(&p)
+                .ok()
+                .map(|h| h.eq_ignore_ascii_case(&expected))
+                == Some(true)
+        })
+        .await
+        .unwrap_or(false);
+        if intact {
+            return Ok(dest);
+        }
+        emit_log(app, "客户端 jar sha1 校验失败（文件可能损坏），重新下载…");
+        let _ = tokio::fs::remove_file(&dest).await;
     }
     let mirror = app
         .state::<crate::state::AppState>()
@@ -714,14 +778,15 @@ pub async fn ensure_client_jar(
 /// 同步 zip 解压（只解 .dll/.so 等 natives 需要的文件）
 pub fn extract_zip_to(zip_path: &Path, dest_dir: &Path) -> Result<()> {
     let file = std::fs::File::open(zip_path)?;
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| LauncherError::Message(format!("打开 zip 失败 {}: {e}", zip_path.display())))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| {
+        LauncherError::Message(format!("打开 zip 失败 {}: {e}", zip_path.display()))
+    })?;
     std::fs::create_dir_all(dest_dir)?;
 
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| {
-            LauncherError::Message(format!("zip 条目读取失败 (#{i}): {e}"))
-        })?;
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| LauncherError::Message(format!("zip 条目读取失败 (#{i}): {e}")))?;
         let Some(name) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
             continue; // 跳过不安全路径
         };

@@ -14,3 +14,7 @@ vite.config.ts.timestamp-*
 /src-tauri/target/release/bundle
 # 早期调研用的临时样本（forge installer / jre zip / 参考源码）
 /.spike
+# 构建日志（含本机路径，不入库）
+*.log
+# 统一用 pnpm，忽略 npm 生成的锁文件
+/package-lock.json

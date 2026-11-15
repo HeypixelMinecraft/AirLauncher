@@ -3,7 +3,7 @@
  * A Tauri-based launcher for the AirPlus Minecraft client.
  * https://github.com/lmx0721/AirPlus
  */
-use serde::{ser::Serializer, Serialize};
+use serde::{Serialize, ser::Serializer};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LauncherError {

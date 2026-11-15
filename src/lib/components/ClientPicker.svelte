@@ -44,6 +44,28 @@
   let downloading = $state(false);
   let progress = $state<DownloadProgress | null>(null);
   let dlError = $state<string | null>(null);
+  /** 关闭动画期间保持挂载，150ms 后再真正卸载 */
+  let mounted = $state(false);
+  let closing = $state(false);
+
+  // 打开/关闭的挂载与退场动画（不改变原有事件流）
+  $effect(() => {
+    const isOpen = open;
+    if (isOpen) {
+      untrack(() => {
+        mounted = true;
+        closing = false;
+      });
+      return;
+    }
+    if (!untrack(() => mounted)) return;
+    closing = true;
+    const t = window.setTimeout(() => {
+      mounted = false;
+      closing = false;
+    }, 150);
+    return () => window.clearTimeout(t);
+  });
   /** 当前正在做哪一步（客户端 / 推荐模组），显示在进度条上方 */
   let stage = $state("");
 
@@ -252,16 +274,17 @@
   }
 </script>
 
-{#if open}
+{#if mounted}
   <div
     class="mask"
+    class:closing
     role="presentation"
     onclick={(e) => {
       // 只有点在遮罩本身（而不是弹窗内部）才关闭，省掉弹窗上的 stopPropagation
       if (!downloading && e.target === e.currentTarget) onclose?.();
     }}
   >
-    <div class="dialog card" role="dialog" aria-modal="true" tabindex="-1">
+    <div class="dialog" class:closing role="dialog" aria-modal="true" tabindex="-1">
       <header>
         <h2>{startAfterPick ? "还没有安装 AirPlus 客户端" : "切换客户端版本"}</h2>
         <p class="hint">
@@ -336,7 +359,7 @@
               <div class="stage">{stage}</div>
             {/if}
             <div class="bar">
-              <div class="fill" style="transform: scaleX({pct() / 100})"></div>
+              <div class="fill running" style="transform: scaleX({pct() / 100})"></div>
             </div>
             <div class="pline">
               <span>
@@ -372,24 +395,76 @@
   .mask {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.55);
+    background: rgba(8, 12, 11, 0.45);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
     display: flex;
     align-items: center;
     justify-content: center;
     z-index: 60;
+    animation: mask-in 200ms var(--ease-out);
+  }
+  :root[data-theme="light"] .mask {
+    background: rgba(30, 40, 36, 0.3);
+  }
+  .mask.closing {
+    animation: mask-out 150ms var(--ease-out) forwards;
   }
   .dialog {
-    width: min(560px, calc(100vw - 80px));
+    width: min(90%, 640px);
     max-height: min(76vh, 640px);
     padding: 20px 22px;
     display: flex;
     flex-direction: column;
     gap: 14px;
     overflow-y: auto;
-    background: var(--window-strong, #1b1a1f);
+    background: var(--window-strong);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
     border: 1px solid var(--line);
-    border-radius: var(--radius);
-    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+    border-radius: var(--radius-card);
+    box-shadow: var(--shadow-2);
+    animation: dialog-in 260ms var(--ease-spring);
+  }
+  .dialog.closing {
+    animation: dialog-out 150ms var(--ease-out) forwards;
+  }
+  @keyframes mask-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+  @keyframes mask-out {
+    to {
+      opacity: 0;
+    }
+  }
+  @keyframes dialog-in {
+    from {
+      opacity: 0;
+      transform: scale(0.96);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+  @keyframes dialog-out {
+    to {
+      opacity: 0;
+      transform: scale(0.98);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .mask,
+    .dialog,
+    .mask.closing,
+    .dialog.closing {
+      animation: none;
+    }
   }
   header h2 {
     margin: 0 0 6px;
@@ -415,7 +490,7 @@
     cursor: pointer;
   }
   .select option {
-    background: #1b1a1f;
+    background: var(--window-strong);
     color: var(--text);
   }
   .check {
@@ -423,9 +498,9 @@
     align-items: flex-start;
     gap: 8px;
     padding: 8px 10px;
-    border-radius: var(--radius-sm);
+    border-radius: var(--radius);
     border: 1px solid var(--line);
-    background: rgba(255, 255, 255, 0.03);
+    background: var(--window);
     font-size: 12.5px;
     line-height: 1.5;
     cursor: pointer;
@@ -463,8 +538,8 @@
     max-height: 148px;
     overflow-y: auto;
     padding: 10px 12px;
-    border-radius: var(--radius-sm);
-    background: rgba(8, 8, 12, 0.4);
+    border-radius: var(--radius);
+    background: var(--window);
     border: 1px solid var(--line);
     font-family: var(--font);
     font-size: 12px;
@@ -495,11 +570,13 @@
   }
   .bar {
     height: 6px;
-    border-radius: 999px;
-    background: rgba(255, 255, 255, 0.08);
+    border-radius: var(--radius-full);
+    background: var(--accent-soft);
     overflow: hidden;
   }
   .fill {
+    position: relative;
+    overflow: hidden;
     height: 100%;
     width: 100%;
     background: var(--accent);
@@ -507,6 +584,30 @@
     transform: scaleX(0);
     /* 进度每 100ms 更新一次，用 transform 只做合成层，不触发布局 */
     transition: transform 0.1s linear;
+  }
+  .fill.running::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    width: 24%;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.35), transparent);
+    animation: sweep 1.2s linear infinite;
+  }
+  :root[data-theme="light"] .fill.running::after {
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.25), transparent);
+  }
+  @keyframes sweep {
+    from {
+      transform: translateX(-100%);
+    }
+    to {
+      transform: translateX(420%);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .fill.running::after {
+      animation: none;
+    }
   }
   .pline {
     display: flex;

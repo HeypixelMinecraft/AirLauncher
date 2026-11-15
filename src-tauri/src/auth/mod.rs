@@ -169,18 +169,28 @@ pub async fn auth_login(app: tauri::AppHandle) {
 
     tauri::async_runtime::spawn(async move {
         let result = login_interactive(&app, &token).await;
-        app.state::<AppState>().cancels.lock().unwrap().remove("auth");
-        if let Err(e) = &result {
-            if !matches!(e, LauncherError::Cancelled) {
-                emit_stage(&app, "error", &e.to_string());
-            }
+        app.state::<AppState>()
+            .cancels
+            .lock()
+            .unwrap()
+            .remove("auth");
+        if let Err(e) = &result
+            && !matches!(e, LauncherError::Cancelled)
+        {
+            emit_stage(&app, "error", &e.to_string());
         }
     });
 }
 
 #[tauri::command]
 pub async fn auth_cancel(app: tauri::AppHandle) {
-    let token = app.state::<AppState>().cancels.lock().unwrap().get("auth").cloned();
+    let token = app
+        .state::<AppState>()
+        .cancels
+        .lock()
+        .unwrap()
+        .get("auth")
+        .cloned();
     if let Some(token) = token {
         token.cancel();
     }
@@ -192,7 +202,10 @@ pub async fn accounts_list() -> Result<Vec<AccountInfo>> {
     tauri::async_runtime::spawn_blocking(|| {
         load_accounts()
             .into_iter()
-            .map(|a| AccountInfo { id: a.id, name: a.name })
+            .map(|a| AccountInfo {
+                id: a.id,
+                name: a.name,
+            })
             .collect()
     })
     .await

@@ -96,7 +96,7 @@
   <section class="list">
     {#each accounts.list as acc (acc.id)}
       <div
-        class="card account"
+        class="card clickable account"
         class:active={settings.activeAccountId === acc.id}
         role="button"
         tabindex="0"
@@ -146,6 +146,8 @@
   }
   h2 {
     margin: 0 0 4px;
+    font-size: 18px;
+    font-weight: 600;
   }
   p {
     margin: 0;
@@ -183,9 +185,9 @@
     font-weight: 700;
     letter-spacing: 4px;
     color: var(--accent);
-    background: rgba(7, 152, 252, 0.12);
-    border: 1px solid rgba(7, 152, 252, 0.35);
-    border-radius: var(--radius-sm);
+    background: var(--accent-soft);
+    border: 1px solid var(--accent-strong);
+    border-radius: var(--radius);
     padding: 6px 14px;
     user-select: text;
     -webkit-user-select: text;
@@ -200,12 +202,12 @@
   }
   .auth-error {
     padding: 12px 16px;
-    border-color: rgba(220, 80, 80, 0.4);
+    border-left: 3px solid var(--danger);
   }
   .spinner {
     width: 18px;
     height: 18px;
-    border: 2px solid var(--border);
+    border: 2px solid var(--line);
     border-top-color: var(--accent);
     border-radius: 50%;
     animation: spin 0.9s linear infinite;
@@ -233,9 +235,9 @@
   .avatar {
     width: 34px;
     height: 34px;
-    border-radius: 8px;
+    border-radius: var(--radius-sm);
     background: var(--accent);
-    color: #fff;
+    color: var(--accent-contrast);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -265,8 +267,8 @@
     border-radius: 6px;
   }
   .icon-btn:hover {
-    color: #e06c6c;
-    background: rgba(255, 255, 255, 0.06);
+    color: var(--danger);
+    background: var(--window);
   }
   .empty {
     padding: 18px 16px;

@@ -16,7 +16,7 @@ use crate::paths;
 use serde_json::Value;
 use std::io::Read;
 use std::path::PathBuf;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio_util::sync::CancellationToken;
 
 /// 1.8.9 对应的 Forge 版本（与 AirPlus 依赖的 11.15.1.2318 一致）
@@ -59,6 +59,9 @@ fn universal_jar_path_in(libraries_dir: &std::path::Path) -> PathBuf {
 }
 
 fn emit_stage(app: &AppHandle, stage: &str) {
+    if crate::warmup::active() {
+        return; // 预热不打扰主界面日志
+    }
     let _ = app.emit(events::FORGE_STAGE, stage.to_string());
 }
 
@@ -72,11 +75,17 @@ pub async fn ensure_installed(app: &AppHandle, token: &CancellationToken) -> Res
     emit_stage(app, "downloading");
     let installer = download::cache_path(&format!("forge-{FORGE_VERSION}-installer.jar"));
     if !installer.exists() {
+        // BMCLAPI 等 Mojang 系镜像同样代理了 maven.minecraftforge.net，
+        // 国内用户选了镜像后 Forge 安装器也应该走镜像（40MB+，直连经常卡住）
+        let mirror = app
+            .state::<crate::state::AppState>()
+            .settings_snapshot()
+            .mirror;
         download::fetch_to(
             app,
             "forge-install",
             "Forge 安装器",
-            &mojang::map_url(&installer_url(), None), // Forge maven 不走 Mojang 镜像映射
+            &mojang::map_url(&installer_url(), mirror.as_deref()),
             &installer,
             None,
             token,
@@ -183,7 +192,11 @@ mod tests {
         );
 
         let universal = universal_jar_path_in(&tmp.join("libraries"));
-        assert!(universal.exists(), "universal jar 未写出: {}", universal.display());
+        assert!(
+            universal.exists(),
+            "universal jar 未写出: {}",
+            universal.display()
+        );
         assert!(
             std::fs::metadata(&universal).unwrap().len() > 3_000_000,
             "universal jar 尺寸异常"

@@ -122,7 +122,7 @@
       <h2>模组</h2>
       <p class="muted">Modrinth · 自动过滤 Minecraft 1.8.9 + Forge</p>
     </div>
-    <button class="import" onclick={importLocal}>导入本地 jar</button>
+    <button class="btn" onclick={importLocal}>导入本地 jar</button>
   </section>
 
   <form class="searchbar" onsubmit={(e) => { e.preventDefault(); doSearch(); }}>
@@ -142,7 +142,7 @@
 
   <section class="results">
     {#each results as hit (hit.projectId)}
-      <div class="card hit">
+      <div class="card clickable hit">
         <div
           class="hit-head"
           role="button"
@@ -258,33 +258,26 @@
     font-family: "Cascadia Mono", Consolas, monospace;
     font-size: 12px;
   }
-  .import {
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 8px 14px;
-    font-size: 13px;
-    cursor: pointer;
-  }
-  .import:hover {
-    border-color: var(--accent);
-  }
   .searchbar {
     display: flex;
     gap: 8px;
   }
   .searchbar input {
     flex: 1;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: 8px;
+    background: var(--window);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
     color: var(--text);
     padding: 9px 12px;
     font-size: 13px;
     outline: none;
+    transition:
+      border-color var(--dur-fast) var(--ease-out),
+      box-shadow var(--dur-fast) var(--ease-out);
   }
   .searchbar input:focus {
     border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
   }
   .err,
   .empty {
@@ -309,7 +302,7 @@
     flex-shrink: 0;
   }
   .placeholder {
-    background: var(--surface-2);
+    background: var(--window);
     color: var(--text-muted);
     display: flex;
     align-items: center;
@@ -341,7 +334,7 @@
     gap: 4px;
     margin-top: 10px;
     padding-top: 10px;
-    border-top: 1px solid var(--border);
+    border-top: 1px solid var(--line);
   }
   .ver {
     display: flex;
@@ -360,14 +353,14 @@
     gap: 8px;
   }
   .of-err {
-    color: #e0a06c;
+    color: var(--danger);
   }
   .btn.small {
     padding: 4px 12px;
     font-size: 12px;
   }
   .btn.danger {
-    color: #e06c6c;
-    border-color: rgba(220, 80, 80, 0.4);
+    color: var(--danger);
+    border-color: var(--danger);
   }
 </style>

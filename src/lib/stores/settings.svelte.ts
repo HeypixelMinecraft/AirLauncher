@@ -14,6 +14,9 @@ export const settings = $state<Settings>({
   githubPat: null,
   mirror: null,
   activeAccountId: null,
+  javaPath: null,
+  javaSource: null,
+  systemJavaPath: null,
 });
 
 /*

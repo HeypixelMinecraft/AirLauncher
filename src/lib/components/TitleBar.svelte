@@ -45,11 +45,10 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    height: 42px;
+    height: 44px;
     flex: none;
     padding-left: 14px;
-    background: var(--window-strong);
-    border-bottom: 1px solid var(--line);
+    background: transparent;
     user-select: none;
     cursor: default;
   }
@@ -105,7 +104,7 @@
     height: 11px;
   }
   .ctl:hover {
-    background: rgba(255, 255, 255, 0.08);
+    background: var(--card-hover);
     color: var(--text);
   }
   .ctl.close:hover {

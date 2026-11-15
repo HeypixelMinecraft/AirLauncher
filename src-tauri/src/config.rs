@@ -24,6 +24,13 @@ pub struct Settings {
     pub mirror: Option<String>,
     /// 当前选中的微软账号 id（accounts.json 中的账号）
     pub active_account_id: Option<String>,
+    /// 用户手动指定的 Java 路径（最高优先级，设置页「浏览…」选择）
+    pub java_path: Option<String>,
+    /// 上次解析出的 Java 来源："manual" | "bundled" | "system" | "download"
+    /// 持久化检测结果，避免每次冷启动都重新扫描系统 Java
+    pub java_source: Option<String>,
+    /// 上次找到的系统 Java 路径（javaSource = "system" 时有效）
+    pub system_java_path: Option<String>,
 }
 
 impl Default for Settings {
@@ -36,6 +43,9 @@ impl Default for Settings {
             github_pat: None,
             mirror: None,
             active_account_id: None,
+            java_path: None,
+            java_source: None,
+            system_java_path: None,
         }
     }
 }

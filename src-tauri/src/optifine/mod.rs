@@ -11,7 +11,6 @@ use crate::download;
 use crate::error::{LauncherError, Result};
 use crate::paths;
 use serde::Serialize;
-use tauri::AppHandle;
 
 const MC_VERSION: &str = "1.8.9";
 const DOWNLOADS_URL: &str = "https://optifine.net/downloads";
