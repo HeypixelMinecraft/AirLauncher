@@ -14,7 +14,8 @@ name: build
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    # 仓库沿用的 tag 命名是 AirLauncher_0.1.0，同时兼容 vX.Y.Z
+    tags: ["v*", "AirLauncher_*"]
   pull_request:
   workflow_dispatch:
 
@@ -84,6 +85,7 @@ jobs:
           path: |
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/airlauncher.exe
           # 打包失败时宁可让 CI 红，也不要产出一个空 artifact
           if-no-files-found: error
           retention-days: 14
@@ -98,4 +100,7 @@ jobs:
           # Release 不存在就先建（--generate-notes 用提交记录自动生成更新说明）
           gh release view "$TAG" >/dev/null 2>&1 ||
             gh release create "$TAG" --title "$TAG" --generate-notes --draft=false
-          gh release upload "$TAG" src-tauri/target/release/bundle/nsis/*.exe --clobber
+          gh release upload "$TAG" \
+            src-tauri/target/release/bundle/nsis/*.exe \
+            src-tauri/target/release/airlauncher.exe \
+            --clobber
