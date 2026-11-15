@@ -17,6 +17,7 @@ use crate::paths;
 use crate::state::AppState;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio_util::sync::CancellationToken;
 
@@ -36,20 +37,58 @@ pub fn is_client_jar(name: &str) -> bool {
     lower.starts_with(CLIENT_PREFIX) && lower.ends_with(".jar")
 }
 
-/// mods 目录里已有的客户端 jar
+/// 从文件名里取出 build 序号（AirPlus-b5.jar -> 5）。
+/// 认不出编号（手工改过名字）时返回 0，排序退化为按修改时间。
+fn build_rank(name: &str) -> u64 {
+    let lower = name.to_lowercase();
+    let Some(rest) = lower
+        .strip_prefix(CLIENT_PREFIX)
+        .and_then(|s| s.strip_suffix(".jar"))
+    else {
+        return 0;
+    };
+    let digits: String = rest
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    digits.parse().unwrap_or(0)
+}
+
+/// mods 里「应该生效」的客户端 jar：build 号最大的那个。
+///
+/// 不能直接取 `read_dir` 的最后一个匹配项：NTFS 按文件名枚举，b3 排在 b4 前面，
+/// 而 Forge 1.8.9 遇到同 modid 的多个 jar 会保留**先枚举到**的那个，
+/// 于是出现「下载了 b4，进游戏却是 b3」。这里显式按 build 号（同号再看修改时间）取最大。
 pub fn find_client_jar(mods: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(mods).ok()?;
-    let mut found: Option<PathBuf> = None;
-    for entry in entries.flatten() {
+    let mut best: Option<(u64, u64, PathBuf)> = None;
+    for entry in std::fs::read_dir(mods).ok()?.flatten() {
         let path = entry.path();
         if !path.is_file() {
             continue;
         }
-        if is_client_jar(&entry.file_name().to_string_lossy()) {
-            found = Some(path);
+        if !is_client_jar(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let rank = build_rank(&entry.file_name().to_string_lossy());
+        let mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if best
+            .as_ref()
+            .is_none_or(|(r, t, _)| (rank, mtime) > (*r, *t))
+        {
+            best = Some((rank, mtime, path));
         }
     }
-    found
+    best.map(|(_, _, p)| p)
 }
 
 /// 删除除 `keep` 之外的客户端 jar。
@@ -71,21 +110,30 @@ pub fn remove_other_clients(mods: &Path, keep: Option<&str>) {
     }
 }
 
-/// 启动前确保 mods 里有客户端：有就直接用，没有就自动装最新 release。
+/// 让指定 jar 成为 mods 里唯一的客户端，并更新下载清单的生效标记。
+///
+/// 下载完成（`download::start_task` 的 client origin）与手动切换都走这里：
+/// 只要 mods 里同时存在两个客户端，Forge 加载哪一个就取决于目录枚举顺序，
+/// 「下载了 b4 结果跑的是 b3」就是这么来的。
+pub fn adopt(mods: &Path, file_name: &str) {
+    remove_other_clients(mods, Some(file_name));
+    crate::manifest::set_active_client(file_name);
+}
+
+/// 启动前确保 mods 里有且只有一个客户端：有就直接用（顺带清掉旧版本），
+/// 没有就自动装最新 release。
 pub async fn ensure_installed(app: &AppHandle, token: &CancellationToken) -> Result<PathBuf> {
     let mods = paths::get().mods_dir.clone();
 
     if let Some(existing) = find_client_jar(&mods) {
-        emit_log(
-            app,
-            &format!(
-                "已安装客户端：{}",
-                existing
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            ),
-        );
+        let name = existing
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        // 早期版本下载后不会清理旧 jar，这里补一刀：正常情况只会剩一个文件。
+        remove_other_clients(&mods, Some(&name));
+        crate::manifest::set_active_client(&name);
+        emit_log(app, &format!("已安装客户端：{name}"));
         return Ok(existing);
     }
 
@@ -136,12 +184,12 @@ pub async fn ensure_installed(app: &AppHandle, token: &CancellationToken) -> Res
         done.sha1,
     );
 
-    remove_other_clients(&mods, Some(&asset.name));
+    adopt(&mods, &asset.name);
     emit_log(app, &format!("客户端安装完成：{}", asset.name));
     Ok(dest)
 }
 
-/// 把已下载的客户端设为唯一生效版本（前端在下载任务完成后调用）
+/// 把已下载的客户端设为唯一生效版本（前端在下载任务完成后调用；后端下载完成时也会自动做一次）
 #[tauri::command]
 pub async fn client_activate(name: String) -> Result<()> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -151,8 +199,7 @@ pub async fn client_activate(name: String) -> Result<()> {
                 "客户端 {name} 还未下载完成，请稍后重试"
             )));
         }
-        remove_other_clients(&mods, Some(&name));
-        crate::manifest::set_active_client(&name);
+        adopt(&mods, &name);
         Ok(())
     })
     .await

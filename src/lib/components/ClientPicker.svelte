@@ -14,7 +14,7 @@
 -->
 <script lang="ts">
   import { listReleases, downloadAsset, type GhRelease, type GhAsset } from "$lib/api/github";
-  import { clientActivate, clientStatus } from "$lib/api/client";
+  import { clientActivate, clientStatus, type ClientStatus } from "$lib/api/client";
   import { modsList, optifineInstall, optifineVersions, type OptifineVersion } from "$lib/api/mods";
   import { onDownloadProgress, type DownloadProgress } from "$lib/events";
   import { formatBytes } from "$lib/stores/downloads.svelte";
@@ -40,6 +40,8 @@
   let loading = $state(false);
   let loadError = $state<string | null>(null);
   let selectedTag = $state<string | null>(null);
+  /** mods 里当前生效的客户端（用来在列表里标「当前」并默认选中） */
+  let current = $state<ClientStatus | null>(null);
 
   let downloading = $state(false);
   let progress = $state<DownloadProgress | null>(null);
@@ -91,6 +93,11 @@
   const available = $derived(releases.filter((r) => pickAsset(r) !== null));
   const selected = $derived(available.find((r) => r.tag_name === selectedTag) ?? null);
   const selectedAsset = $derived(selected ? pickAsset(selected) : null);
+  /** 某个 release 是否就是 mods 里当前生效的那个版本 */
+  const isCurrent = (r: GhRelease) => {
+    const tag = current?.tag;
+    return !!tag && r.tag_name.toLowerCase() === tag.toLowerCase();
+  };
 
   // open 变 true 时刷新列表（每次打开都重新拉，避免看到过期的版本）。
   // untrack 是必须的：load() 内部会读写 loading/releases 等状态，
@@ -98,10 +105,29 @@
   $effect(() => {
     if (!open) return;
     untrack(() => {
-      void load();
+      // 先拿到当前生效版本，load() 才能把它默认选中
+      void (async () => {
+        await loadStatus();
+        await load();
+      })();
       void loadOptifine();
     });
   });
+
+  async function loadStatus() {
+    try {
+      current = await clientStatus();
+    } catch {
+      current = null;
+    }
+  }
+
+  /** 当前生效的 tag 在 release 列表里对应的那一项（tag 大小写两边都可能不一致） */
+  function findCurrentRelease(list: GhRelease[]): GhRelease | undefined {
+    const tag = current?.tag?.toLowerCase();
+    if (!tag) return undefined;
+    return list.find((r) => r.tag_name.toLowerCase() === tag && pickAsset(r) !== null);
+  }
 
   async function load() {
     if (loading) return;
@@ -110,8 +136,11 @@
     try {
       const list = await listReleases();
       releases = list;
-      // 默认选中第一个正式版，没有正式版就取第一个
-      const first = list.find((r) => !r.prerelease && pickAsset(r)) ?? list.find((r) => pickAsset(r));
+      // 默认选中当前生效版本（用户要知道自己在哪一档）；没有就取第一个正式版
+      const first =
+        findCurrentRelease(list) ??
+        list.find((r) => !r.prerelease && pickAsset(r)) ??
+        list.find((r) => pickAsset(r));
       selectedTag = first?.tag_name ?? null;
     } catch (e) {
       loadError = String(e);
@@ -238,6 +267,7 @@
 
       stage = "正在启用客户端";
       await clientActivate(asset.name);
+      await loadStatus();
 
       // 推荐模组放在客户端之后装：OptiFine 是普通 mod jar，不依赖客户端是否已就绪，
       // 但顺序反过来时若 OptiFine 失败会让用户误以为客户端也没装上。
@@ -288,9 +318,15 @@
       <header>
         <h2>{startAfterPick ? "还没有安装 AirPlus 客户端" : "切换客户端版本"}</h2>
         <p class="hint">
-          {startAfterPick
-            ? "首次启动需要先下载客户端本体（jar）。选一个版本，下载完成后会自动开始启动。"
-            : "下载后会替换掉 mods 里现有的客户端，保证只有一个版本生效。"}
+          {#if startAfterPick}
+            首次启动需要先下载客户端本体（jar）。选一个版本，下载完成后会自动开始启动。
+          {:else}
+            下载后会替换掉 mods 里现有的客户端，保证只有一个版本生效（多版本共存时 Forge
+            会加载先枚举到的那个）。
+            {#if current?.installed}
+              <strong>当前生效：AirPlus {current.tag ?? current.fileName}</strong>
+            {/if}
+          {/if}
         </p>
       </header>
 
@@ -313,8 +349,8 @@
           <select class="input select" bind:value={selectedTag} disabled={downloading}>
             {#each available as r (r.tag_name)}
               <option value={r.tag_name}>
-                {r.tag_name}{r.prerelease ? "（预发布）" : ""} · {r.published_at?.slice(0, 10) ??
-                  "未知日期"}
+                {r.tag_name}{r.prerelease ? "（预发布）" : ""}{isCurrent(r) ? " · 当前" : ""} · {r
+                  .published_at?.slice(0, 10) ?? "未知日期"}
               </option>
             {/each}
           </select>
@@ -347,6 +383,9 @@
             <span>{selectedAsset ? formatBytes(selectedAsset.size) : "—"}</span>
             <span class="dot">·</span>
             <span>{selectedAsset?.name ?? "无 jar"}</span>
+            {#if isCurrent(selected)}
+              <span class="badge">当前生效</span>
+            {/if}
           </div>
           {#if selected.body}
             <pre class="notes">{selected.body.slice(0, 800)}</pre>
@@ -383,7 +422,15 @@
         <div class="actions">
           <button class="btn" onclick={() => onclose?.()} disabled={downloading}>取消</button>
           <button class="btn primary" onclick={startDownload} disabled={downloading || !selectedAsset}>
-            {downloading ? "下载中…" : startAfterPick ? "下载并启动" : "下载并切换"}
+            {#if downloading}
+              下载中…
+            {:else if startAfterPick}
+              下载并启动
+            {:else if selected && isCurrent(selected)}
+              重新下载并切换
+            {:else}
+              下载并切换
+            {/if}
           </button>
         </div>
       {/if}
@@ -532,6 +579,18 @@
   }
   .dot {
     opacity: 0.5;
+  }
+  .badge {
+    padding: 0 7px;
+    border-radius: var(--radius-full);
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 11px;
+    line-height: 1.7;
+  }
+  .hint strong {
+    color: var(--accent);
+    font-weight: 600;
   }
   .notes {
     margin: 0;

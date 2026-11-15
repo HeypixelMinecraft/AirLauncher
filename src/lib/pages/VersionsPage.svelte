@@ -138,10 +138,14 @@
                 {:else if starting[asset.name]}
                   <span class="dlmeta"><span class="spin"></span>准备中…</span>
                 {:else}
-                  <button class="btn" onclick={() => install(asset, r.tag_name)}>下载</button>
+                  <button class="btn" onclick={() => install(asset, r.tag_name)}>下载并切换</button>
                 {/if}
               </div>
             {/each}
+            <p class="tip">
+              客户端 jar 会装进 mods 并自动成为唯一生效版本，旧版本会被清掉
+              （多个客户端共存时 Forge 会加载先枚举到的那个，容易版本对不上）。
+            </p>
           </div>
 
           <div class="changelog">
@@ -247,6 +251,12 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
+  }
+  .tip {
+    margin: 2px 0 0;
+    font-size: 11.5px;
+    line-height: 1.6;
+    color: var(--text-muted);
   }
   .asset {
     display: flex;

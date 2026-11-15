@@ -203,6 +203,18 @@ pub fn start_task(
         // 下载成功才记录，失败/取消不留痕迹
         if let (Ok(done), Some(o)) = (&result, origin.as_ref()) {
             manifest::record_download(o, &file_name, &url, done.size, done.sha1.clone());
+
+            // 客户端 jar 一落地就收敛成唯一生效版本：只靠前端拿完成事件再调
+            // client_activate 的话，中间这段时间 mods 里会同时躺着新旧两个客户端，
+            // Forge 会加载先枚举到的旧 jar（「下了 b4 跑的是 b3」就是这么来的）。
+            if matches!(o, manifest::Origin::Client { .. }) {
+                let mods = paths::get().mods_dir.clone();
+                let name = file_name.clone();
+                let _ = tauri::async_runtime::spawn_blocking(move || {
+                    crate::client::adopt(&mods, &name)
+                })
+                .await;
+            }
         }
 
         // 终态进度由 run_download_full 统一发（内部下载与后台任务共用同一套收尾）

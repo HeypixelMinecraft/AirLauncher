@@ -167,6 +167,12 @@
     }
   }
 
+  /** 打开版本选择弹窗：startAfterPick=false 表示只是切换版本，下完不自动启动 */
+  function openVersionPicker() {
+    startAfterPick = false;
+    pickerOpen = true;
+  }
+
   /** 弹窗里下好并激活了客户端 */
   async function onClientReady() {
     clientStatus()
@@ -253,7 +259,11 @@
     </div>
 
     <div class="hero-right">
-      <button class="pill" onclick={() => (view.current = "versions")} title="查看或切换客户端版本">
+      <button
+        class="pill"
+        onclick={openVersionPicker}
+        title="切换客户端版本（会替换掉 mods 里现有的客户端）"
+      >
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <path
             d="M12 3v10m0 0 4-4m-4 4-4-4M4 17v3h16v-3"
@@ -272,6 +282,7 @@
               ? `AirPlus ${client.tag ?? "已安装"}`
               : "未安装"}
         </span>
+        <span class="chip">{client?.installed ? "切换版本" : "选择版本"}</span>
       </button>
 
       <button class="pill" onclick={() => (view.current = "accounts")} title="管理登录账号">
@@ -505,6 +516,23 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* 版本 pill 右侧的「切换版本」提示：点整个 pill 都会打开弹窗 */
+  .chip {
+    flex: none;
+    margin-left: 2px;
+    padding: 2px 9px;
+    border-radius: var(--radius-full);
+    background: var(--accent);
+    color: var(--accent-contrast);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.2px;
+    transition: background var(--dur-fast) var(--ease-out);
+  }
+  .pill:hover .chip {
+    background: var(--accent-strong);
+    color: var(--text);
   }
 
   /* ---- 日志折叠岛 ---- */

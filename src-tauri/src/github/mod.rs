@@ -43,9 +43,11 @@ pub async fn list_releases(pat: Option<String>) -> Result<Vec<GhRelease>> {
 }
 
 /// 把 release asset（客户端 jar）直接下载到 mods 目录。
-/// 下载完成后由前端调用 `client_activate` 清理旧版本，使其成为唯一生效的客户端。
 ///
-/// `tag` 是 release 标签（如 b4），会写进下载清单，用来回答「下过哪些版本」。
+/// 下载成功后下载管线会自动把它设为唯一生效的客户端（清掉旧的 jar），
+/// 前端不需要再额外调用 `client_activate`——保留这个命令只是为了兼容旧调用。
+///
+/// `tag` 是 release 标签（如 B4），会写进下载清单，用来回答「下过哪些版本」。
 pub fn download_asset(
     app: &tauri::AppHandle,
     asset: &GhAsset,
