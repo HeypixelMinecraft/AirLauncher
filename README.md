@@ -4,6 +4,8 @@ AirPlus 客户端（`lmx0721/AirPlus`）专属启动器 —— 亚克力半透�
 
 > 技术栈：**Tauri 2（Rust 后端）+ SvelteKit 5 / TypeScript（前端）**
 
+<img width="894" height="582" alt="启动器截图" src="https://github.com/user-attachments/assets/e5fc7c5f-c975-4232-9327-6a23a0013f60" />
+
 ## 功能
 
 | 功能 | 说明 |
