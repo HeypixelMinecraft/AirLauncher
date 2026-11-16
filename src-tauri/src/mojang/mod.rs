@@ -16,7 +16,7 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio_util::sync::CancellationToken;
@@ -436,7 +436,7 @@ pub async fn load_merged_profile(token: &CancellationToken) -> Result<VersionPro
     Ok(profile)
 }
 
-/// 下载全部缺失的库，返回 classpath 条目（不含 natives），并把 natives 解压到位
+/// 下载全部缺失的库（并发），返回 classpath 条目（不含 natives），并把 natives 解压到位
 pub async fn ensure_libraries(
     app: &AppHandle,
     profile: &VersionProfile,
@@ -447,19 +447,28 @@ pub async fn ensure_libraries(
     let natives_dir = paths::get().natives_dir(&profile.id);
     tokio::fs::create_dir_all(&natives_dir).await?;
 
-    let mirror = app
+    let snapshot = app
         .state::<crate::state::AppState>()
-        .settings_snapshot()
-        .mirror;
+        .settings_snapshot();
+    let mirror = snapshot.mirror.clone();
+    let concurrency = snapshot.download_concurrency.clamp(1, 16) as usize;
     let mirror = mirror.as_deref();
     let task_id = "launch-libs".to_string();
     let total = profile.libraries.len();
-    let mut done = 0usize;
 
-    let mut classpath: Vec<PathBuf> = Vec::new();
+    /// 一条待下载任务（dest 与 slots 里存的路径同源）
+    struct Job {
+        name: String,
+        url: String,
+        dest: PathBuf,
+        sha1: Option<String>,
+    }
+
+    let mut jobs: Vec<Job> = Vec::new();
     let mut native_zips: Vec<PathBuf> = Vec::new();
+    let mut slots: Vec<Option<PathBuf>> = vec![None; total];
 
-    for lib in &profile.libraries {
+    for (idx, lib) in profile.libraries.iter().enumerate() {
         if !rules_allow(&lib.rules) {
             continue;
         }
@@ -468,16 +477,12 @@ pub async fn ensure_libraries(
             if let Some(info) = lib.natives_info() {
                 let dest = libs_dir.join(&info.path);
                 if !dest.exists() {
-                    download::fetch_to(
-                        app,
-                        &task_id,
-                        &lib.name,
-                        &map_url(&info.url, mirror),
-                        &dest,
-                        info.sha1.as_deref(),
-                        token,
-                    )
-                    .await?;
+                    jobs.push(Job {
+                        name: lib.name.clone(),
+                        url: map_url(&info.url, mirror),
+                        dest: dest.clone(),
+                        sha1: info.sha1.clone(),
+                    });
                 }
                 native_zips.push(dest);
             }
@@ -486,21 +491,52 @@ pub async fn ensure_libraries(
         if let Some(info) = lib.download_info() {
             let dest = libs_dir.join(&info.path);
             if !dest.exists() {
-                download::fetch_to(
-                    app,
-                    &task_id,
-                    &lib.name,
-                    &map_url(&info.url, mirror),
-                    &dest,
-                    info.sha1.as_deref(),
-                    token,
-                )
-                .await?;
+                jobs.push(Job {
+                    name: lib.name.clone(),
+                    url: map_url(&info.url, mirror),
+                    dest: dest.clone(),
+                    sha1: info.sha1.clone(),
+                });
             }
-            classpath.push(dest);
+            slots[idx] = Some(dest);
         }
-        done += 1;
-        emit_log(app, &format!("库 {done}/{total}: {}", lib.name));
+    }
+
+    // 并发下载全部缺失的库。之前是 for 循环串行 await：BMCLAPI 每个请求
+    // 有 2-5s 的重定向/CDN 延迟，36 个库串行要 2-3 分钟（PCL2 是并发的，
+    // 所以显得我们的下载「有一项特别久」）。缺失库并发后压到十几秒。
+    if !jobs.is_empty() {
+        emit_log(
+            app,
+            &format!("依赖库缺失 {} 个（共 {total}），并发下载中…", jobs.len()),
+        );
+        let done = Arc::new(AtomicUsize::new(0));
+        let pending = jobs.len();
+        stream::iter(jobs)
+            .map(|job| {
+                let app = app.clone();
+                let task_id = task_id.clone();
+                let done = done.clone();
+                let token = token.clone();
+                async move {
+                    download::fetch_to(
+                        &app,
+                        &task_id,
+                        &job.name,
+                        &job.url,
+                        &job.dest,
+                        job.sha1.as_deref(),
+                        &token,
+                    )
+                    .await?;
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    emit_log(&app, &format!("库 {n}/{pending}: {}", job.name));
+                    Ok::<(), LauncherError>(())
+                }
+            })
+            .buffer_unordered(concurrency)
+            .try_collect::<Vec<()>>()
+            .await?;
     }
 
     // 解压 natives（同步 zip，量小放阻塞线程）
@@ -515,7 +551,9 @@ pub async fn ensure_libraries(
     .await
     .map_err(|e| LauncherError::Message(format!("natives 解压任务失败: {e}")))??;
 
-    Ok(classpath)
+    // 按版本 JSON 原顺序组装 classpath；任何一个库下载失败都会在上面
+    // 提前返回，能走到这里说明全部就绪
+    Ok(slots.into_iter().flatten().collect())
 }
 
 /// 资源索引读取（半截/损坏文件会返回 Err，由调用方重下）
@@ -612,7 +650,10 @@ pub async fn ensure_assets(
         ),
     );
 
-    let concurrency = snapshot.download_concurrency.clamp(1, 16) as usize;
+    // 资源对象普遍只有几十 KB，吞吐受每连接延迟限制而非带宽：并发固定拉满
+    // 全局信号量（16）。设置里的 download_concurrency 是为单任务分片设计的，
+    // 对这种上千个小文件的延迟受限型负载，低并发只会白白浪费时间。
+    let concurrency = 16usize;
     let base = map_url(ASSET_BASE, mirror.as_deref());
     let task_id = "launch-assets".to_string();
     let done_bytes = Arc::new(AtomicU64::new(0));
