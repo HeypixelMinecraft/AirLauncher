@@ -18,3 +18,7 @@ vite.config.ts.timestamp-*
 *.log
 # 统一用 pnpm，忽略 npm 生成的锁文件
 /package-lock.json
+# 启动器运行时数据（实例、缓存、用户设置），不入库
+/instances
+/cache
+/settings.json

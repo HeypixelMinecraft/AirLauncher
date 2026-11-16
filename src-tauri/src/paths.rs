@@ -5,7 +5,11 @@
  *
  * 所有路径均在运行时从数据根目录派生，禁止硬编码绝对路径。
  *
- * 数据根目录默认是 `%LOCALAPPDATA%/<identifier>`，也可以在设置里改到任意位置。
+ * 数据目录默认是 `%LOCALAPPDATA%/<identifier>`，也可以在设置里改到任意位置。
+ * 无论默认还是自定义，启动器都会在数据目录下自动创建 `AirLauncher` 文件夹，
+ * 把全部数据（实例、游戏、JRE、缓存、配置）收纳在里面；
+ * 用户手动把数据目录指到某个名为 AirLauncher 的文件夹时不再重复嵌套。
+ *
  * 指向自定义目录的信息必须放在一个「位置固定」的引导文件里（默认目录下的
  * launcher.json），否则搬走数据后启动器就再也找不到自己的数据了。
  */
@@ -19,6 +23,9 @@ static PATHS: OnceLock<AppPaths> = OnceLock::new();
 
 /// 引导文件：只记录「数据目录在哪」，始终留在默认目录下
 const BOOTSTRAP_FILE: &str = "launcher.json";
+
+/// 数据目录下的数据子文件夹：所有数据、游戏等全部收纳在里面
+const DATA_FOLDER: &str = "AirLauncher";
 
 /// 迁移数据目录时要整体搬走的内容
 const MIGRATE_ENTRIES: &[&str] = &[
@@ -39,9 +46,9 @@ struct Bootstrap {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppPaths {
-    /// 数据根目录（默认 %LOCALAPPDATA%/<identifier>，可自定义）
+    /// 数据根目录（= 数据目录下的 AirLauncher 子文件夹，可自定义数据目录）
     pub root: PathBuf,
-    /// 默认数据目录（「恢复默认」用）
+    /// 默认数据目录（引导文件所在位置，「恢复默认」用）
     pub default_root: PathBuf,
     /// 实例总目录
     pub instances_dir: PathBuf,
@@ -70,29 +77,28 @@ impl AppPaths {
             .app_local_data_dir()
             .expect("无法确定应用数据目录");
 
-        let mut root = default_root.clone();
+        let mut base = default_root.clone();
         if let Some(custom) = read_bootstrap(&default_root) {
             let p = PathBuf::from(&custom);
             if p.is_absolute() {
-                root = p;
+                base = p;
             } else {
                 eprintln!("自定义数据目录不是绝对路径，忽略：{custom}");
             }
         }
 
-        if let Err(e) = ensure_dirs(&root) {
-            if root != default_root {
+        let root = match prepare(&base) {
+            Some(r) => r,
+            None => {
                 // 自定义目录可能被删了 / 移动硬盘没插：回退默认目录，别让启动器起不来
                 eprintln!(
-                    "自定义数据目录不可用（{e}），回退到默认目录 {}",
+                    "自定义数据目录不可用，回退到默认目录 {}",
                     default_root.display()
                 );
-                root = default_root.clone();
-                ensure_dirs(&root).expect("无法创建启动器目录结构");
-            } else {
-                panic!("无法创建启动器目录结构: {e}");
+                base = default_root.clone();
+                prepare(&base).expect("无法创建启动器目录结构")
             }
-        }
+        };
 
         Self::from_root(root, default_root)
     }
@@ -149,6 +155,45 @@ fn ensure_dirs(root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// 数据目录里的实际数据根：自动创建 AirLauncher 子文件夹，所有数据、游戏等全部收在里面。
+/// 用户手动把数据目录指到某个名为 AirLauncher 的文件夹时不再重复嵌套。
+fn resolve_root(base: &Path) -> PathBuf {
+    let self_named = base
+        .file_name()
+        .map(|n| n.eq_ignore_ascii_case(DATA_FOLDER))
+        .unwrap_or(false);
+    if self_named {
+        base.to_path_buf()
+    } else {
+        base.join(DATA_FOLDER)
+    }
+}
+
+/// 确保数据目录存在、自动创建 AirLauncher 数据子目录，
+/// 并把旧版本直接散落在数据目录下的数据搬进去。
+fn prepare(base: &Path) -> Option<PathBuf> {
+    std::fs::create_dir_all(base).ok()?;
+    let root = resolve_root(base);
+    migrate_legacy(base, &root);
+    ensure_dirs(&root).ok()?;
+    Some(root)
+}
+
+/// 旧版本把数据直接放在数据目录下：升级后全部搬进 AirLauncher 子目录。
+/// 新目录已存在同名内容时保留新目录，源文件原样留着不动。
+fn migrate_legacy(base: &Path, root: &Path) {
+    for name in MIGRATE_ENTRIES {
+        let src = base.join(name);
+        let dst = root.join(name);
+        if !src.exists() || dst.exists() || src == dst {
+            continue;
+        }
+        if let Err(e) = move_entry(&src, &dst) {
+            eprintln!("迁移旧数据 {name} 失败（{e}）");
+        }
+    }
+}
+
 fn read_bootstrap(default_root: &Path) -> Option<String> {
     let bytes = std::fs::read(default_root.join(BOOTSTRAP_FILE)).ok()?;
     let parsed: Bootstrap = serde_json::from_slice(&bytes).ok()?;
@@ -180,10 +225,11 @@ fn write_bootstrap(default_root: &Path, data_dir: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// 切换数据目录：把现有数据整体搬到新目录，并写入引导文件。
+/// 切换数据目录：把现有数据整体搬到新目录（自动套上 AirLauncher 子文件夹），
+/// 并写入引导文件。
 ///
-/// 返回新目录；调用方（前端）需要重启启动器让新路径生效——
-/// `AppPaths` 是进程内只读的，运行中改不了。
+/// 返回实际的数据根目录（新目录下的 AirLauncher 文件夹）；调用方（前端）需要
+/// 重启启动器让新路径生效——`AppPaths` 是进程内只读的，运行中改不了。
 pub fn set_data_dir(raw: &str) -> Result<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -203,35 +249,36 @@ pub fn set_data_dir(raw: &str) -> Result<PathBuf> {
     let current = get();
     let old_root =
         clean_path(std::fs::canonicalize(&current.root).unwrap_or_else(|_| current.root.clone()));
+    let new_root = resolve_root(&target);
 
-    if target == old_root {
-        return Ok(target);
+    if new_root == old_root {
+        return Ok(new_root);
     }
     // 互相嵌套时整目录搬迁会自己吞自己，直接拒绝
-    if target.starts_with(&old_root) || old_root.starts_with(&target) {
+    if new_root.starts_with(&old_root) || old_root.starts_with(&new_root) {
         return Err(LauncherError::Config(
             "新目录不能与当前数据目录互相包含，请换一个位置".into(),
         ));
     }
 
-    migrate(&old_root, &target)?;
+    migrate(&old_root, &new_root)?;
     write_bootstrap(&current.default_root, Some(&target))?;
-    Ok(target)
+    Ok(new_root)
 }
 
 /// 恢复默认数据目录（不搬数据，旧目录里的文件保持原样）
 pub fn reset_data_dir() -> Result<PathBuf> {
     let current = get();
     let default_root = current.default_root.clone();
-    if std::fs::canonicalize(&current.root).ok().as_deref()
-        == std::fs::canonicalize(&default_root).ok().as_deref()
-    {
-        return Ok(default_root);
+    if read_bootstrap(&default_root).is_none() {
+        return Ok(current.root.clone());
     }
     write_bootstrap(&default_root, None)?;
-    ensure_dirs(&default_root)
+    let root = resolve_root(&default_root);
+    migrate_legacy(&default_root, &root);
+    ensure_dirs(&root)
         .map_err(|e| LauncherError::Config(format!("创建默认目录失败（{e}）")))?;
-    Ok(default_root)
+    Ok(root)
 }
 
 fn migrate(old: &Path, new: &Path) -> Result<()> {

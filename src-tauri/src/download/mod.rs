@@ -3,7 +3,7 @@
  * A Tauri-based launcher for the AirPlus Minecraft client.
  * https://github.com/lmx0721/AirPlus
  *
- * 统一下载管线：并发限制、Range 断点续传、sha1 校验、指数退避重试、节流进度事件。
+ * 统一下载管线：并发限制、Range 断点续传、多连接分片（所有下载源）、sha1 校验、指数退避重试、节流进度事件。
  */
 use crate::error::{LauncherError, Result};
 use crate::events;
@@ -39,8 +39,8 @@ const MAX_ATTEMPTS: u32 = 3;
 const SEGMENT_THRESHOLD: u64 = 4 * 1024 * 1024;
 /// 每片最小字节数，避免切出一堆只有几百 KB 的碎片
 const MIN_SEGMENT_SIZE: u64 = 1024 * 1024;
-/// 分片数上限（再多连接收益递减，还容易被 CDN 限流）
-const MAX_SEGMENTS: u64 = 8;
+/// 分片数上限（与设置的 download_concurrency 上限 16 对齐）
+const MAX_SEGMENTS: u64 = 16;
 
 /// 全局并发上限（兜底）。实际并发由调用方控制（设置里的 download_concurrency
 /// 上限 16），这里只防止异常路径把连接数顶爆。
@@ -380,34 +380,31 @@ async fn download_once(
         return Err(LauncherError::Cancelled);
     }
 
-    // 大文件（客户端 jar）在全新下载时走多连接分片，能明显吃满带宽；
-    // 断点续传仍走单连接（.part 里已有内容，分片拼接会破坏续传语义）。
-    if resume_from == 0
-        && crate::mirror::is_github(url)
-        && let Some(total) = probe_total(&resolved).await
-        && total >= SEGMENT_THRESHOLD
-    {
-        match download_segmented(app, task_id, name, &resolved, dest, sha1_hex, token, total).await
-        {
-            Ok(done) => return Ok(done),
-            Err(LauncherError::Cancelled) => return Err(LauncherError::Cancelled),
-            // 镜像不支持 Range / 分片中途失败：静默回退单连接，
-            // 不走重试循环，避免「明明能下却报分片失败」
-            Err(_) => {}
-        }
-        if token.is_cancelled() {
-            return Err(LauncherError::Cancelled);
+    // 先发正式请求拿 Content-Length：大文件（≥ 阈值）且全新下载时改走多连接分片，
+    // 所有下载源（Mojang / Forge / Modrinth / GitHub 镜像…）统一生效。
+    // 小文件这次请求本身就是正式下载的第一发，没有额外开销。
+    let mut resp = send_request(&resolved, resume_from).await?;
+
+    if resume_from == 0 {
+        let probed_total = resp.content_length().unwrap_or(0);
+        if probed_total >= SEGMENT_THRESHOLD {
+            drop(resp);
+            match download_segmented(app, task_id, name, &resolved, dest, sha1_hex, token, probed_total)
+                .await
+            {
+                Ok(done) => return Ok(done),
+                Err(LauncherError::Cancelled) => return Err(LauncherError::Cancelled),
+                // 服务器不支持 Range / 分片中途失败：静默回退单连接，
+                // 不走重试循环，避免「明明能下却报分片失败」
+                Err(_) => {}
+            }
+            if token.is_cancelled() {
+                return Err(LauncherError::Cancelled);
+            }
+            resp = send_request(&resolved, resume_from).await?;
         }
     }
 
-    let mut req = net::get()
-        .get(&resolved)
-        // 明确要求不压缩：保证 Content-Length 与 Range 语义可靠
-        .header("Accept-Encoding", "identity");
-    if resume_from > 0 {
-        req = req.header("Range", format!("bytes={resume_from}-"));
-    }
-    let resp = req.send().await?.error_for_status()?;
     let resumed = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
     let total: u64 = resp
         .content_length()
@@ -505,32 +502,14 @@ async fn finish_file(
     })
 }
 
-/// 探测服务端是否支持 Range 以及文件总大小（`Range: bytes=0-0`）
-///
-/// 只等响应头，不读正文；加超时是为了不让慢线路把「开始下载」拖成几十秒。
-async fn probe_total(url: &str) -> Option<u64> {
-    tokio::time::timeout(Duration::from_secs(6), async {
-        let resp = net::get()
-            .get(url)
-            .header("Range", "bytes=0-0")
-            .header("Accept-Encoding", "identity")
-            .send()
-            .await
-            .ok()?;
-        if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-            return None;
-        }
-        let range = resp
-            .headers()
-            .get(reqwest::header::CONTENT_RANGE)?
-            .to_str()
-            .ok()?;
-        // 形如 `bytes 0-0/123456`
-        range.rsplit('/').next()?.trim().parse().ok()
-    })
-    .await
-    .ok()
-    .flatten()
+/// 发起下载请求；断点续传时带 Range 头。
+/// 明确要求不压缩：保证 Content-Length 与 Range 语义可靠。
+async fn send_request(url: &str, resume_from: u64) -> Result<reqwest::Response> {
+    let mut req = net::get().get(url).header("Accept-Encoding", "identity");
+    if resume_from > 0 {
+        req = req.header("Range", format!("bytes={resume_from}-"));
+    }
+    Ok(req.send().await?.error_for_status()?)
 }
 
 /// 多连接分片下载：把文件切成 N 段并发拉取，最后拼接。
